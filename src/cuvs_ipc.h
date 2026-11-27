@@ -516,8 +516,9 @@ typedef struct CuvsCmdFrame {
     uint32_t n_partials;    /* BUILD: ADR-059; 0 = single corpus (shm_key/passed fd),
                              * >0 = N worker partials follow the index_dir frame as a
                              * CuvsPartialDesc list (daemon mmaps each → direct H2D). */
-    uint32_t graph_degree;             /* BUILD: 3R; 0 = cuVS default (64) */
-    uint32_t intermediate_graph_degree;/* BUILD: 3R; 0 = cuVS default (128) */
+    uint32_t graph_degree;             /* BUILD, COMPACT: 3R; 0 = cuVS default (64);
+                                        * COMPACT: 0 = keep the resident width */
+    uint32_t intermediate_graph_degree;/* BUILD, COMPACT: 3R; 0 = cuVS default (128) */
     uint32_t build_algo;               /* BUILD: 3R; CUVS_CAGRA_BUILD_* (0=AUTO) */
     /* D-wedge filter (Option A Custom Scan / Option B Function API).
      * 0 = no filter; >0 = sorted uint64_t TID array in filter_shm_key shm.
@@ -1376,12 +1377,18 @@ int cuvs_ipc_extend(
 /* 3Q: COMPACT — ask the daemon to compact a loaded CAGRA index by removing
  * tombstoned vectors via cagra::merge. No payload: the daemon reads the
  * .tombstone sidecar directly from index_dir. Returns CUVS_STATUS_OK on
- * success or if there is nothing to compact (no .tombstone file). */
+ * success or if there is nothing to compact (no .tombstone file).
+ * #261: graph_degree / intermediate_graph_degree are the index's reloptions,
+ * sent in the frame's BUILD fields; the merge rebuilds with them. */
 int cuvs_ipc_compact(
     const char *socket_path,
     uint32_t    db_oid,
     uint32_t    index_oid,
-    const char *index_dir
+    const char *index_dir,
+    uint32_t    graph_degree,              /* 0 = keep the resident width */
+    uint32_t    intermediate_graph_degree, /* 0 = 128 */
+    uint32_t   *width_before,              /* out, nullable: graph width before, 0 = none */
+    uint32_t   *width_after                /* out, nullable: graph width after, 0 = none */
 );
 
 int cuvs_ipc_set_vram_budget(

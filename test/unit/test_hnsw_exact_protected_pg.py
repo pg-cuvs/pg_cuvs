@@ -69,12 +69,17 @@ def main():
         text = '\n'.join(ask(x, 'EXPLAIN(FORMAT JSON,COSTS OFF) ' + query + ';'))
         return json.loads(text)[0]['Plan']
 
+    barriers = iter(range(1, 1 << 30))
+
     def expect_error(x, sql, *fragments):
         start = len(x.errors)
         ask(x, sql)
         ask(x, 'ROLLBACK;')  # the failed statement left the transaction aborted
-        ask(x, "DO $$BEGIN RAISE NOTICE 'PROTECTED_BARRIER'; END$$;")
-        assert x.wait_error('PROTECTED_BARRIER', 10), x.errors
+        # A tag of its own for each call: wait_error looks at every stderr line read so far, so a tag an earlier call
+        # raised would end the wait before this statement's error reached the stderr reader thread.
+        tag = f'PROTECTED_BARRIER_{next(barriers)}'
+        ask(x, f"DO $$BEGIN RAISE NOTICE '{tag}'; END$$;")
+        assert x.wait_error(tag, 10), x.errors
         got = '\n'.join(x.errors[start:])
         for f in fragments:
             assert f in got, (f, got)

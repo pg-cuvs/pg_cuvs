@@ -40,7 +40,7 @@ DATA           = sql/pg_cuvs--0.1.0.sql \
                  sql/pg_cuvs--0.9.2--0.9.3.sql \
                  sql/pg_cuvs--0.9.3.sql
 MODULE_big     = pg_cuvs
-REGRESS        = smoke upgrade_path cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing hnsw_insert_shift hnsw_layer_status hnsw_build_m hnsw_build_ef hnsw_source_conversion hnsw_source_maintenance hnsw_source_conversion_file pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison prefilter_short_fill_guard ivfpq_smoke cagra_streaming cagra_dynbatch cagra_search_params auto_compact extend_vram_fallback stream_bf_recall fallback_stat vram_accounting build_lock flat_smoke transient_bf hw_profile routing_golden routing_golden_measured multi_vector daemon_uid_owner unordered_scan null_query_vector rmm_pool admission_reject
+REGRESS        = smoke upgrade_path cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing hnsw_insert_shift hnsw_layer_status hnsw_build_m hnsw_build_ef hnsw_source_conversion hnsw_source_maintenance hnsw_source_conversion_file pg_cuvs_hnsw metrics brute_force brute_force_after_extend brute_force_after_compact pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison prefilter_short_fill_guard ivfpq_smoke ivfpq_drop_release cagra_streaming cagra_dynbatch cagra_search_params auto_compact extend_vram_fallback stream_bf_recall fallback_stat vram_accounting build_lock flat_smoke transient_bf hw_profile routing_golden routing_golden_measured multi_vector daemon_uid_owner unordered_scan null_query_vector rmm_pool admission_reject compact_graph_degree compact_width_notice
 REGRESS_OPTS   = --inputdir=test --outputdir=test
 
 # Tier-1 CI (CPU-reference shim, PGCUVS_CPU_SHIM=1) runs a SUBSET of REGRESS.
@@ -48,7 +48,9 @@ REGRESS_OPTS   = --inputdir=test --outputdir=test
 #   build_hnsw/build_hnsw_edge/pg_cuvs_hnsw/build_hnsw_halfvec/
 #     build_hnsw_packing/hnsw_insert_shift/hnsw_build_m — CAGRA->pgvector HNSW *graph export* (real graph
 #     structure; a Tier-2 / real-GPU concern).
-REGRESS_TIER2_ONLY = build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing hnsw_insert_shift hnsw_build_m hnsw_build_ef hnsw_source_conversion_file pg_cuvs_hnsw routing_golden_measured
+#   compact_graph_degree — the width of the compacted CAGRA graph (#261); the shim
+#     keeps no graph and writes its own index file format.
+REGRESS_TIER2_ONLY = build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing hnsw_insert_shift hnsw_build_m hnsw_build_ef hnsw_source_conversion_file pg_cuvs_hnsw routing_golden_measured compact_graph_degree
 REGRESS_TIER1      = $(filter-out $(REGRESS_TIER2_ONLY),$(REGRESS))
 
 # #124: build_oom, build_multi_oom, build_oom_evict_to_fit, and extend_cuda_oom
@@ -198,7 +200,8 @@ endif
 src/cuvs_wrapper.o: src/cuvs_wrapper.cu src/cuvs_wrapper.h src/cuvs_hnsw_sdk_plan.cuh \
                     src/cuvs_hnsw_nn_sdk_params.cuh src/cuvs_hnsw_nn_precision.h src/cuvs_hnsw_nn_capacity.h src/cuvs_hnsw_nn_upper_contract.h src/cuvs_hnsw_nn_center.h \
                     src/cuvs_failed_allocation.hpp src/cuvs_rmm_failure_resource.hpp \
-                    src/cuvs_cagra_fold.h src/cuvs_cagra_fold_capacity.h src/cuvs_cagra_fold_sdk.hpp src/.cuvs-fold-mode
+                    src/cuvs_cagra_fold.h src/cuvs_cagra_fold_capacity.h src/cuvs_cagra_fold_sdk.hpp \
+                    src/cuvs_page_overlay_gpu_rmm.hpp src/.cuvs-fold-mode
 	$(CUVS_SDK_PLAN_NOTE)
 	$(NVCC) $(NVCC_FLAGS) $(CUVS_SDK_PLAN_FLAGS) $(CUVS_FOLD_CPPFLAGS) -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src -c $< -o $@
 
@@ -252,6 +255,24 @@ SERVER_CFLAGS  = -O2 -g -Wall -Wextra -I./src \
 # Optional sanitizer/debug hooks for the daemon (e.g. CI ASAN job passes
 # EXTRA_SERVER_CFLAGS="-fsanitize=address -fno-omit-frame-pointer"). Empty by default.
 SERVER_CFLAGS += $(EXTRA_SERVER_CFLAGS) $(CUVS_FOLD_PRODUCT_CPPFLAGS)
+EXTRA_CLEAN += src/cuvs_page_overlay_gpu.o
+ifeq ($(CUVS_FOLD_NATIVE),1)
+SERVER_CFLAGS += -DCUVS_PAGE_OVERLAY_GPU
+SERVER_PAGE_GPU_OBJ = src/cuvs_page_overlay_gpu.o
+
+src/cuvs_page_overlay_gpu.o: src/cuvs_page_overlay_gpu.cu src/cuvs_page_overlay_gpu_kernel.cuh \
+                             src/cuvs_page_overlay_gpu.h src/cuvs_page_overlay_gpu_rmm.hpp \
+                             src/cuvs_page_overlay.h src/cuvs_ipc.h src/cuvs_util.h src/.cuvs-fold-mode
+	$(NVCC) $(NVCC_FLAGS) -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src -c $< -o $@
+
+.PHONY: test-page-overlay-gpu-reclaim
+test-page-overlay-gpu-reclaim: test/gpu/test_page_overlay_gpu_reclaim.c $(SERVER_PAGE_GPU_OBJ) $(WRAPPER_OBJ) \
+                               src/cuvs_page_overlay_server.o src/cuvs_util_server.o src/cuvs_peak_meter_server.o
+	$(CC) -std=gnu11 -O2 -Wall -Wextra -Werror -I src -c $< -o $@.o
+	$(CXX) -o $@ $@.o $(filter %.o,$^) $(SERVER_LDFLAGS) -lm
+	./$@
+endif
+EXTRA_CLEAN += test-page-overlay-gpu-reclaim test-page-overlay-gpu-reclaim.o
 ifeq ($(CUVS_PAGE_FORMAT),1)
 SERVER_CFLAGS += -DCUVS_PAGE_FORMAT
 endif
@@ -323,7 +344,7 @@ src/cuvs_wrapper_shim_cpu.o: src/cuvs_wrapper_shim_cpu.c src/cuvs_wrapper.h src/
 src/cuvs_page_overlay_server.o: src/cuvs_page_overlay.c src/cuvs_page_overlay.h src/cuvs_ipc.h
 	$(CC) $(SERVER_CFLAGS) -c $< -o $@
 
-$(SERVER_BIN): src/pg_cuvs_server.o src/cuvs_ipc_server.o src/cuvs_util_server.o src/cuvs_objstore_server.o src/cuvs_build_corpus_server.o src/cuvs_cache_policy_server.o src/cuvs_peak_meter_server.o src/cuvs_hnsw_upper_server.o src/cuvs_page_overlay_server.o $(WRAPPER_OBJ)
+$(SERVER_BIN): src/pg_cuvs_server.o src/cuvs_ipc_server.o src/cuvs_util_server.o src/cuvs_objstore_server.o src/cuvs_build_corpus_server.o src/cuvs_cache_policy_server.o src/cuvs_peak_meter_server.o src/cuvs_hnsw_upper_server.o src/cuvs_page_overlay_server.o $(WRAPPER_OBJ) $(SERVER_PAGE_GPU_OBJ)
 	$(CXX) -o $@ $^ $(SERVER_LDFLAGS)
 
 server: $(SERVER_BIN)
@@ -368,7 +389,7 @@ src/cuvs_hnsw_upper_server_test.o: src/cuvs_hnsw_upper.c src/cuvs_hnsw_upper.h
 src/cuvs_page_overlay_server_test.o: src/cuvs_page_overlay.c src/cuvs_page_overlay.h src/cuvs_ipc.h
 	$(CC) $(SERVER_TEST_CFLAGS) -c $< -o $@
 
-$(SERVER_TEST_BIN): src/pg_cuvs_server_test.o src/cuvs_ipc_server_test.o src/cuvs_util_server_test.o src/cuvs_objstore_server_test.o src/cuvs_build_corpus_server_test.o src/cuvs_cache_policy_server_test.o src/cuvs_peak_meter_server_test.o src/cuvs_hnsw_upper_server_test.o src/cuvs_page_overlay_server_test.o $(WRAPPER_OBJ)
+$(SERVER_TEST_BIN): src/pg_cuvs_server_test.o src/cuvs_ipc_server_test.o src/cuvs_util_server_test.o src/cuvs_objstore_server_test.o src/cuvs_build_corpus_server_test.o src/cuvs_cache_policy_server_test.o src/cuvs_peak_meter_server_test.o src/cuvs_hnsw_upper_server_test.o src/cuvs_page_overlay_server_test.o $(WRAPPER_OBJ) $(SERVER_PAGE_GPU_OBJ)
 	$(CXX) -o $@ $^ $(SERVER_LDFLAGS)
 
 server-test: $(SERVER_TEST_BIN)
@@ -774,10 +795,17 @@ test-i3b-source: test/unit/check_i3b_server_source.py src/pg_cuvs_server.c test/
 
 .PHONY: test-i3b-source
 
-test-unit: test-page-overlay
-.PHONY: test-page-overlay
+test-unit: test-page-overlay test-page-overlay-gpu-cache
+.PHONY: test-page-overlay test-page-overlay-gpu-cache
 test-page-overlay:
 	ulimit -c 0; CC="$(CC)" python3 -I -B test/unit/test_page_overlay_mutations.py
+
+test-page-overlay-gpu-cache:
+	$(CC) -std=gnu11 -O2 -Wall -Wextra -Werror -I src -o $@ \
+		test/unit/test_page_overlay_gpu_cache.c src/cuvs_page_overlay.c -lm
+	./$@
+
+EXTRA_CLEAN += test-page-overlay-gpu-cache
 
 
 # CK-34: the peak meter under 8 concurrent threads, reset, and off.
@@ -1396,6 +1424,7 @@ EXTRA_CLEAN += test-physical-build-guard
 .PHONY: test-physical-build-guard test-physical-build-mutations
 ifeq ($(shell uname -s),Linux)
 test-unit: test-physical-build-guard
+test-unit: test-legacy-bf-sidecar
 
 # the host upper-layer builder: levels and file size fixed by the input whatever the thread count,
 # every element above level 0 linked on level 1, level 0 without self links or duplicates, the cancel stop.
@@ -1418,6 +1447,21 @@ test-physical-build-guard:
 
 test-physical-build-mutations:
 	CC=$(CC) python3 -I test/unit/test_physical_build_mutations.py
+
+# Legacy sidecar validity through the actual daemon with a CPU wrapper.
+LEGACY_BF_CASES ?= reused-tid streaming alias rollback build-crash build-fsync-rollback \
+	compact-retry-unlink compact-retry-fsync compact-retry-publish compact-retry-tombstone binding-other-dir \
+	compact-shutdown-before compact-shutdown-after compact-shutdown-before-enoent \
+	compact-enoent-before compact-enoent-after
+EXTRA_CLEAN += test-legacy-bf-sidecar
+.PHONY: test-legacy-bf-sidecar
+test-legacy-bf-sidecar:
+	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -DCUVS_TEST_HOOKS -ffunction-sections -fdata-sections -I src \
+		test/unit/test_legacy_bf_sidecar.c src/cuvs_ipc.c src/cuvs_util.c \
+		src/cuvs_objstore.c src/cuvs_build_corpus.c src/cuvs_wrapper_shim_cpu.c \
+		src/cuvs_cache_policy.c src/cuvs_peak_meter.c src/cuvs_page_overlay.c src/cuvs_hnsw_upper.c \
+		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o $@
+	@set -e; for scenario in $(LEGACY_BF_CASES); do ./$@ "$$scenario"; done
 
 # I3-E / C8: rejection counters, memory_status I3-E columns, build_status rows
 # for in-flight unlocked CAGRA builds, through the actual daemon source (CPU
@@ -1503,6 +1547,21 @@ test-page-fold-admission:
 		src/cuvs_cagra_fold_unavailable.c \
 		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o $@
 	./$@ $(FOLD_ADMISSION_CASE)
+
+# Actual fold re-selection after mock GPU cache reclamation, on CPU CI.
+EXTRA_CLEAN += test-page-overlay-gpu-admission
+.PHONY: test-page-overlay-gpu-admission
+ifeq ($(shell uname -s),Linux)
+test-unit: test-page-overlay-gpu-admission
+endif
+test-page-overlay-gpu-admission:
+	$(CC) -std=gnu11 -O1 -DPGCUVS_CPU_SHIM -DCUVS_CAGRA_FOLD_ENABLED -DCUVS_PAGE_OVERLAY_GPU \
+		-ffunction-sections -fdata-sections -I src test/unit/test_hnsw_route_daemon.c \
+		src/cuvs_ipc.c src/cuvs_util.c src/cuvs_objstore.c src/cuvs_build_corpus.c \
+		src/cuvs_wrapper_shim_cpu.c src/cuvs_cache_policy.c src/cuvs_peak_meter.c \
+		src/cuvs_page_overlay.c src/cuvs_hnsw_upper.c src/cuvs_cagra_fold_unavailable.c \
+		-Wl,--gc-sections -lm -lpthread -lrt -lcurl -lssl -lcrypto -o $@
+	./$@ gpu-host-retry-vram
 
 # Each planted AR8 defect must turn an AR8 test RED. The daemon cases need
 # Linux (elsewhere they are SKIP and the run fails). AR8_MUTATION_OUT must be

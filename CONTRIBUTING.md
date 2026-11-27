@@ -22,7 +22,7 @@ Contributions and collaboration inquiries are welcome.
 - Before opening a pull request, go through the list in the pull request template
   ([.github/pull_request_template.md](.github/pull_request_template.md)) and tick what
   applies in the description. The list is a matter of judgement, and nothing enforces
-  it; the two CI jobs are the mechanical checks.
+  it; the CI jobs are the mechanical checks.
   - Run `make docs-contract-check`, `make test-unit` and `make test-source-checks`.
   - If the change touches the Makefile's GPU compile or link flags, `infra/cuvs-patches`
     or the SDK planner sources, run `scripts/check-sdk-patch-path.sh`. It applies
@@ -49,13 +49,18 @@ Contributions and collaboration inquiries are welcome.
 
 | Branch | Role | How it changes |
 |---|---|---|
-| `main` | Integration branch. Carries the version in development. | Pull request only; both CI jobs (`Unit tests (CPU)`, `Tier 1 — CPU shim (installcheck)`) must pass. Squash merge only; the head branch is deleted after the merge. No force-push, no deletion. |
+| `main` | Integration branch. Carries the version in development. | Pull request only; the CI jobs that run (`CI scope`, `Unit tests (CPU)`, `Tier 1 — CPU shim (installcheck)`, `CAGRA page format (CPU shim)`) must pass. Squash merge only; the head branch is deleted after the merge. No force-push, no deletion. |
 | `release/vX.Y.Z` | Stabilization branch of one release, cut from `main`. | Pull request only, same checks. Receives fixes that are already on `main` (below), no features and no SQL script changes (a hotfix branch adds the scripts of its own version, see Hotfixes). Kept after the tag. |
 | `vX.Y.Z` (tag) | The released commit. | Annotated tag on the last commit of `release/vX.Y.Z`, pushed after the last pull request into that branch has merged. Moved or deleted only while its release is unpublished (checklist step 8), never afterwards. |
 | topic branches | One change each. | Branch from `main`; delete after the merge. |
 
 `.github/workflows/ci.yml` runs on pull requests into `main` and into `release/**`
-and on pushes to both.
+and on pushes to both. On a pull request that changes only documentation (Markdown
+at the top level, under `docs/` and under `design/`, except files a test reads such as
+`docs/reference.md`; the list is in `.github/scripts/ci-scope.sh`), the Tier 1 and
+page-format jobs are skipped and `Unit tests (CPU)`, which runs the documentation
+contract check, still runs. A push runs every job. A test that starts reading a
+documentation file adds that file to the exclusions in `ci-scope.sh`.
 
 The repository deletes the head branch of a merged pull request, so a release branch
 is never the head of one. Before merging a pull request whose branch is the base of

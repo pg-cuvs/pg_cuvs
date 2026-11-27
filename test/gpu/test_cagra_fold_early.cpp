@@ -2,6 +2,7 @@
 
 #include <new>
 #include <utility>
+#include <vector>
 
 static thread_local std::size_t fail_bytes;
 static thread_local bool allocation_failed;
@@ -57,4 +58,47 @@ test_cagra_fold_early_oom(CuvsCagraIndex source, const float *added, int dim)
     if (result && result != source)
         cuvs_cagra_free(result, 0);
     return status == CUVS_CAGRA_FOLD_OOM && result == nullptr;
+}
+
+extern "C" int
+test_cagra_fold_optimized(CuvsCagraIndex source, const float *added, int count, int dim)
+{
+    CuvsCagraFoldShape shape;
+    if (cuvs_cagra_fold_shape(source, &shape) != 0)
+        return 0;
+
+    std::vector<uint32_t> host_graph((shape.rows + 2 * count) * shape.degree);
+    CuvsCagraFoldPhases phases{};
+    const void *device_graph = nullptr;
+    CuvsCagraFoldControl control{};
+    control.optimized = true;
+    control.phases = &phases;
+    control.host_graph = host_graph.data();
+    control.result_device_graph = &device_graph;
+
+    CuvsCagraIndex first = nullptr, second = nullptr, unrelated = nullptr;
+    bool ok = cuvs_cagra_fold_reuse_with_yield(source, added, count, dim, 0, &first, &control) ==
+                  CUVS_CAGRA_FOLD_OK &&
+              device_graph && !phases.host_graph_cache_hit;
+    if (ok) {
+        control.cached_device_graph = device_graph;
+        phases = {};
+        ok = cuvs_cagra_fold_reuse_with_yield(first, added + count * dim, count, dim,
+                                              0, &second, &control) == CUVS_CAGRA_FOLD_OK &&
+             device_graph && phases.host_graph_cache_hit;
+    }
+    if (ok) {
+        control.cached_device_graph = device_graph;
+        phases = {};
+        ok = cuvs_cagra_fold_reuse_with_yield(source, added, count, dim, 0, &unrelated, &control) ==
+                 CUVS_CAGRA_FOLD_OK &&
+             device_graph && !phases.host_graph_cache_hit;
+    }
+    if (ok)
+        ok = cuvs_cagra_fold_shape(second, &shape) == 0 &&
+             shape.rows == host_graph.size() / shape.degree;
+    cuvs_cagra_free(unrelated, 0);
+    cuvs_cagra_free(second, 0);
+    cuvs_cagra_free(first, 0);
+    return ok;
 }

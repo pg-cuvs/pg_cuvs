@@ -41,11 +41,19 @@ corpora that require exhaustive search; use `cagra`/`ivfpq` for approximate sear
 > path couples an exact-BF workload to an unnecessary graph build and cannot be independently cost-
 > calibrated by the planner.
 
-> **Known issue (#237, #239):** once a brute_force search has loaded the daemon's
-> brute-force cache for a `cagra` index, a later INSERT (#237) or a VACUUM that removes dead
-> rows (#239) can make the brute_force path return missing or different rows without an
-> error. The path covers index scans with `cuvs.search_mode = 'brute_force'`,
-> `pg_cuvs_batch_search` in that mode and `cuvs_filtered_knn`. REINDEX the index to recover.
+> For an unsharded legacy `cagra` index, an INSERT that extends the graph or a VACUUM
+> that compacts it invalidates the resident brute-force cache (#237, #239). Before
+> saving the changed graph, the daemon removes its old `.vectors` sidecar. Searches
+> that require that sidecar report an error until it is rebuilt. This
+> includes index scans and `pg_cuvs_batch_search` in `brute_force` mode, and
+> `cuvs_filtered_knn` with a NULL filter. Use `REINDEX` to rebuild the sidecar.
+
+> If a legacy CAGRA compaction fails to save or remove its tombstones, an
+> INSERT that would extend that resident index reports SQLSTATE `40001`.
+> Complete compaction, then retry the transaction.
+> If the tombstones disappear before their rows are removed, or the daemon
+> shuts down with those rows still in the resident graph, the index is marked
+> stale. Use `REINDEX` to restore GPU searches and writes to the graph.
 
 **NULL query vector.** A `cagra` / `flat` / `ivfpq` index scan cannot answer
 `ORDER BY col <-> NULL` — there is no vector to search with — so it raises
@@ -285,7 +293,42 @@ These backend GUCs are registered but are not read by the backend build/search p
 | `cuvs.gcs_key_file` | string | `` | — | SUSET | Registered backend setting only; does not configure daemon credentials |
 | `cuvs.warmup_threads` | int | `2` | 1–8 | SUSET | Registered backend setting only; does not configure daemon warmup threads |
 
-CAGRA compaction (`pg_cuvs_compact` and VACUUM) initially preserves the auto
+CAGRA compaction (`pg_cuvs_compact` and VACUUM) rebuilds the kept rows with the
+index's `graph_degree` and `intermediate_graph_degree` reloptions (before #261 it
+used cuVS's defaults, 64 and 128) and logs
+`[cuvs_cagra_compact] rebuild graph_degree=... intermediate_graph_degree=...`.
+An index compacted to width 64 by an earlier version gets its `graph_degree`
+back at its next compaction. The values are read at each compaction, so a value
+set by `ALTER INDEX ... SET` applies from the next compaction, before any
+`REINDEX`, and the session that ran the compaction gets a NOTICE
+`pg_cuvs: compaction rebuilt index "..." at graph width N (was M)` when the width
+moved to `graph_degree` (a graph that cuVS narrows because the index has
+fewer rows than the degree gets no NOTICE). If the reloptions have `intermediate_graph_degree` below
+`graph_degree`, which `CREATE INDEX` rejects, compaction keeps the current
+graph width and raises a WARNING (`pg_cuvs: compaction of index "..." kept graph width
+N: intermediate_graph_degree (...) is below graph_degree (...)`, with a hint)
+instead of an error. Each message appears once per compaction and index, and
+not when there was nothing to compact. Under autovacuum the WARNING goes to
+the server log (the NOTICE does so only if `log_min_messages` is `notice` or
+lower).
+
+Compaction rebuilds the graph with cuVS's automatic builder choice whatever
+the index's `build_algo` is; only `graph_degree` and
+`intermediate_graph_degree` are taken from the index. Compaction runs inside
+VACUUM, usually with nobody watching, so it uses the choice that falls back
+to another builder when memory is short: on fp16-safe data cuVS takes
+NN-descent when the device has enough memory for it and IVF-PQ otherwise
+(on fp16-unsafe data the daemon makes the same choice before the merge and
+uses fp32 IVF-PQ distances), and a memory failure leads to the explicit IVF-PQ
+retry described below. Measured on one A100 (100,000 rows of 768-dimension
+wiki embeddings, 20% deleted, then compacted; recall@10 over 500 queries; three
+runs per setting): an index built with `build_algo = 'ivf_pq'` had a
+recall@10 0.0002 to 0.0010 lower after compaction than after a `REINDEX` with
+`ivf_pq` (`graph_degree` 64 and 128), and an index built with `nn_descent`
+was within the run-to-run variation. All these values are 0.997 or higher; a
+lower search budget was not measured. To get a graph built with the
+index's `build_algo`, run `REINDEX`, which builds it with that method.
+Compaction initially preserves the auto
 builder choice. A memory failure from NN-descent or an unresolved auto choice
 triggers one IVF-PQ merge retry after the first merge's allocations unwind.
 The retry caps the IVF-PQ internal search batch at 4096 rows (the ordinary
@@ -334,7 +377,7 @@ daemon-only ones have no session equivalent.
 | `--rmm-pool-max-percent N` | `cuvs.rmm_pool_max_percent` (read-only status) | `50` | Hard upstream quota: total CUDA memory × N%, rounded down to 256 bytes, on each allowed GPU. Range 1–100; initial reservation must fit. Preserves the pool's doubling/backoff growth policy |
 | `--rmm-scratch-permille N` | — (daemon-only, `scratch_permille` in `cuvs.rmm_pool_status`) | `9593` (Q1 qualification on one NVIDIA A100-SXM4-80GB host with `--cagra-build-overflow managed`; recalibrate for other GPUs or overflow policies) | CAGRA build scratch coefficient ρ. Admission, reservation and GPU choice use `N = final + ceil(final × ρ / 1000)`; residency accounting keeps `final`. Range 0–100000. Restart to change |
 | `--max-indexes N` | — (daemon-only) | `1024` | **Soft** LRU working-set cap (ADR-068), not a hard wall (was 64). At the cap, a reload or `pg_cuvs_load` frees a slot under the § 8 rules (cold first, then soft eviction; reason `slot`); a build over the cap does not evict (with the default `--build-evict-scope none`): its files are saved and the first query reloads it |
-| `--page-overlay-host-bytes N` | — (daemon-only) | `0` | Explicit host budget for page-overlay chunks during receive, residency and active searches. A zero budget disables chunk allocation. Overlay IPC returns `PAGE_OVERLAY_HOST_FULL` to the caller on budget exhaustion. The per-index row limit also applies. |
+| `--page-overlay-host-bytes N` | — (daemon-only) | `0` | Host budget for page-overlay chunks during receive, residency and active searches, plus fold staging, mirrors and retained host graph buffers when folding is enabled. A zero budget disables chunk allocation. Overlay IPC returns `PAGE_OVERLAY_HOST_FULL` to the caller on budget exhaustion. The per-index row limit also applies. |
 | `--build-evict-scope …` and the other cache flags | — (daemon-only) | see § 8 | Cache, eviction and reclaim knobs (§ 8.2) |
 | `--hnsw-auto-overflow ace\|error` | `hnsw_auto_overflow` in `cuvs.rmm_pool_status` (read-only) | `ace` | What `pg_cuvs_hnsw` `build_algo=auto` does over the resident budget: `ace` spills to ACE-disk with a NOTICE, `error` refuses with SQLSTATE 54000. The same value decides an auto build whose resident IVF-PQ kNN graph cuVS rejects: `ace` rebuilds on ACE-disk with a NOTICE (receipt `graph_fallback`), `error` fails. Startup-only; logged at startup. Explicit `ivf_pq`/`ace` ignore it |
 | `--hnsw-ace-build-quality auto\|Q` | — (daemon-only, restart) | `auto` | ACE partition build quality handed to cuVS (`ace_params.ef_construction` = A; the SDK uses q = A/16, NN-descent runs 5 + q iterations per partition under 1e6 rows). `auto`: q = (the SDK's default NN-descent iterations, 20) − 5 at `ef_construction` 64, i.e. A 240, scaled by `ef_construction`/64. `Q` (0–4095): A = 16·Q for every ACE build, ignoring `ef_construction`. Logged at startup; recorded per index in `pg_cuvs_hnsw_build_info` (`ace_build_quality_source`, `ace_build_quality`). Resident builds ignore it |
@@ -520,9 +563,9 @@ cagra/ivfpq") rather than silently failing.
 
 | Reloption | Type | Default | Range / values | Notes |
 |-----------|------|---------|----------------|-------|
-| `graph_degree` | int | `64` | 8–512 | CAGRA output graph degree |
+| `graph_degree` | int | `64` | 8–512 | CAGRA output graph degree. Compaction rebuilds the graph at this degree |
 | `intermediate_graph_degree` | int | `128` | 8–1024 | Must be ≥ `graph_degree` (fail-closed) |
-| `build_algo` | enum | `auto` | `auto`, `ivf_pq`, `nn_descent` | CAGRA build algorithm. The IVF-PQ kNN search (`ivf_pq`, or `auto` when cuVS picks IVF-PQ) uses fp32 LUT, internal and coarse distances when 4 x max\|x\|^2 of the corpus (max\|x\|^2 for inner product and cosine) reaches 65504, the fp16 maximum; otherwise cuVS's fp16 defaults stay. The daemon logs `[cuvs_cagra_build_multi] knn precision` with the bound and the choice. Compaction (`pg_cuvs_compact`, VACUUM) rebuilds the kept rows with cuVS's `auto` choice under the same rule and logs `[cuvs_cagra_compact] knn precision` |
+| `build_algo` | enum | `auto` | `auto`, `ivf_pq`, `nn_descent` | CAGRA build algorithm. The IVF-PQ kNN search (`ivf_pq`, or `auto` when cuVS picks IVF-PQ) uses fp32 LUT, internal and coarse distances when 4 x max\|x\|^2 of the corpus (max\|x\|^2 for inner product and cosine) reaches 65504, the fp16 maximum; otherwise cuVS's fp16 defaults stay. The daemon logs `[cuvs_cagra_build_multi] knn precision` with the bound and the choice. Compaction (`pg_cuvs_compact`, VACUUM) rebuilds the kept rows with cuVS's `auto` choice under the same rule, whatever this option is, and logs `[cuvs_cagra_compact] knn precision`; `REINDEX` rebuilds with this option |
 | `index_dir` | string | (uses `cuvs.index_dir`) | path | Per-index artifact directory (ADR-045); self-describes in `reloptions` so no-GUC sessions still find it |
 
 **Experimental page format (`CUVS_PAGE_FORMAT=1`).** An expression CAGRA index
@@ -547,6 +590,26 @@ background supplier that visits page-format CAGRA indexes and releases expired
 graph history. This postmaster setting also defaults to `off`. The worker uses
 the daemon's `--page-overlay-host-bytes` budget.
 
+Native page-format daemons can opt into GPU scoring for the resident prefix
+with `--page-overlay-gpu-min-rows`. The default `0` keeps CPU scoring.
+`--page-overlay-gpu-cache-mb` caps the mirrors and scoring workspace per GPU
+(default `1024` MiB). GPU scoring requires an RMM pool. New allocations use
+existing pool backing and defer while a fold is active. A fold that needs
+backing can suspend GPU scoring and reclaim the device allocations and the
+workspace. When a fold cannot reserve host staging, the daemon can reclaim
+workspaces across all devices for its next attempt. If enough rows cannot use
+the GPU, the daemon scores the prefix on the CPU.
+
+Each cached device mirror follows its immutable host chunk. It is released
+when the last graph or cursor releases that chunk. The host budget charges
+packed vectors and mirror metadata together at chunk allocation, and charges
+the pinned scoring workspace separately. The GPU cap and
+daemon VRAM admission also account for the device allocations. Nonstandard
+host floating-point modes use the CPU. The selected
+device returns scores through pinned memory. The daemon resolves uncertain
+scores with its existing ordered CPU calculation and passes all finite scores
+to the resident cursor's visibility checks.
+
 **Experimental page-format fold (`PGCUVS_BETA3A_GPU_FOLD=1`).** Build both the
 extension and daemon with this option and `CUVS_PAGE_FORMAT=1`, using the
 matching cuVS `cpp/src` tree as `CUVS_BETA3A_SDK_SOURCE`. The fold option defaults
@@ -559,8 +622,28 @@ block or subtransaction. Folding requires an existing base GPU graph. After a
 daemon or PostgreSQL restart, PostgreSQL
 retains the WAL-published page state and can use exact heap search if the
 matching GPU graph is unavailable.
-Set the daemon's `--page-overlay-host-bytes` to cover the supplied overlay,
-packed input and the fold's host copies of the expanded dataset and graph.
+
+The daemon reads these environment variables at startup. Restart it to apply
+a change.
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `CUVS_PAGE_FOLD_BATCH_ROWS` | `0` (or unset) | Uses the existing GPU fold algorithm, with up to 16,384 pending positions per fold. A graph becomes eligible at 100 pending positions or after 300 seconds with pending positions. An integer from `1` to `16384` enables optimized folding, caps the number of positions at that value and makes the graph eligible from the first pending position. Other values log a warning and use the default policy. |
+| `CUVS_PAGE_FOLD_PROFILE` | `0` (or unset) | `1` enables diagnostic `[page_fold_phases]` lines in either fold mode. The lines report `staging_us`, `input_us`, `dataset_us`, `graph_setup_us`, `incoming_us`, `search_us`, `rank_us`, `reverse_us`, `scatter_us`, `final_graph_us` and `host_graph_cache_hit`. Timing can add GPU synchronization. Other values log a warning and leave profiling off. |
+
+Set `--page-overlay-host-bytes` to cover the supplied overlay, packed fold
+input and host mirrors of the expanded output. The existing path mirrors the
+graph and dataset. Optimized folds can copy the dataset directly between GPU
+buffers when the dataset row stride equals the vector dimension. That path
+only needs a host graph mirror. Each fold producer can retain one host graph
+buffer for the next fold of the same graph chain, with its allocated capacity
+charged to the same budget. The producer frees it when switching chains,
+after 30 seconds without a successful update, or on thread exit. The fold
+can use an SDK-owned host graph when the cache allocation cannot fit.
+Supply and fold requests under host-budget pressure reclaim idle buffers
+across devices. Producers release borrowed buffers when their current fold
+finishes if a request reported pressure in the meantime.
+
 With the RMM pool enabled, a fold reuses the pool's existing backing and can
 defer when that backing cannot satisfy its allocations. A fold cannot grow the
 pool's backing, which could stay resident after the fold yields to a build.
@@ -828,7 +911,7 @@ an index does the same. Build such an index without `CONCURRENTLY` at a quiet ti
 | `pg_cuvs_hnsw_layer_counts(index regclass)` | record (elements bigint, upper_elements bigint, m integer, entry_level integer, built_hierarchy integer, level1_unlinked bigint) | One `pg_cuvs_hnsw` index that is ready (`indisready`; an index a concurrent build or reindex has not finished writing, failed while writing, or that is being dropped concurrently is refused with SQLSTATE 55000): elements not marked deleted, how many are above level 0, the metapage `m` and entry level, the hierarchy flag its heap build recorded (NULL when none, e.g. a CAGRA-source build), and how many elements above level 0 have no level-1 link (0 when the upper layer is connected; a search descending through level 1 stops at such an element). Reads every page; requires SELECT on the table |
 | `pg_cuvs_hnsw_layer_status()` | SETOF (index regclass, access_method name, current boolean, reason text) | Every `pg_cuvs_hnsw` index the caller can read that is ready (`indisready`; one a concurrent build or reindex is still writing is left out): whether it has upper layers, and why not. `mode='nsw'` before 0.9.3 wrote level 0 only, so rows inserted afterwards held the upper layers alone and searches could miss the built rows; such an index needs `REINDEX INDEX`. A heap build is judged from its recorded hierarchy flag; a CAGRA-source build from the share of elements above level 0 (about 1/m expected, under a quarter of that means none), and NULL below 16 × m elements. With two or more elements above level 0, any of them without a level-1 link makes an index not current, whatever built it (a single upper element, the entry point, has nobody to link to) |
 | `pg_cuvs_build_hnsw(cagra regclass, mode text DEFAULT 'nsw')` | regclass | Build a pgvector HNSW from a CAGRA index without pgvector's CPU build. **Deprecated** in favor of `CREATE INDEX ... USING pg_cuvs_hnsw`; the older two-step `pg_cuvs_import_hnsw` form (empty `USING hnsw` target + import) is removed |
-| `pg_cuvs_compact(index regclass)` | void | Remove tombstoned vectors via `cuvsCagraMerge`, rebuild `.cagra`/`.tids`, drop `.tombstone`. The rebuild uses fp32 IVF-PQ kNN distances under the `build_algo` fp16 rule. If the initial NN-descent or auto merge runs out of memory, retry once with explicit IVF-PQ under that same rule. A pinned IVF-PQ failure is not retried |
+| `pg_cuvs_compact(index regclass)` | void | Remove tombstoned vectors via `cuvsCagraMerge`, rebuild `.cagra`/`.tids` at the index's `graph_degree` and `intermediate_graph_degree`, drop `.tombstone`. The rebuild uses fp32 IVF-PQ kNN distances under the `build_algo` fp16 rule. If the initial NN-descent or auto merge runs out of memory, retry once with explicit IVF-PQ under that same rule. A pinned IVF-PQ failure is not retried |
 | `pg_cuvs_batch_search(rel regclass, queries vector[], k int)` | SETOF (query_idx int, ctid tid, distance real) | Batches Q queries in one GPU dispatch when eligible. Honors `search_mode` and `bf_precision` on the GPU path |
 | `cuvs_filtered_knn(index regclass, query vector, filter_tids bigint[], k int)` | TABLE (ctid tid, distance float4) | Brute-force kNN over the TID set (`block<<16\|off`). NULL means unfiltered, and an empty array returns zero rows |
 | `cuvs_filtered_knn(index regclass, query vector, filter_tids tid[], k int)` | TABLE (ctid tid, distance float4) | Type-safe overload that accepts `ctid` directly |
@@ -1157,7 +1240,10 @@ Counters are cumulative and are not reset when read; only a daemon restart reset
 them. Eviction history (`evict_count`, `last_evict_*`) outlives the resident entry,
 is removed by `DROP INDEX`, and keeps at most 65,536 indexes (oldest dropped first,
 counted in `history_dropped`). `DROP INDEX` cleanup counts as `drops`, not as an
-eviction. Every eviction writes one `[evict]` line (`op gpu db idx reason
+eviction. The daemon hears of a drop of a `cagra`, `ivfpq` or `flat` index when the
+dropping transaction commits (`DROP INDEX CONCURRENTLY`: at its first internal commit);
+a drop inside a transaction that is prepared with `PREPARE TRANSACTION` is not passed
+on, even after `COMMIT PREPARED`: its daemon entry and files stay. Every eviction writes one `[evict]` line (`op gpu db idx reason
 requester_idx idle_s protect_s hits vram_bytes saved_ms mono_us self_replace`;
 `idle_s = -1` for a never-searched index) and every reclaim pass that acts writes
 one `[reclaim]` line (`op gpu tick resident_before resident_after hi_bytes lo_bytes

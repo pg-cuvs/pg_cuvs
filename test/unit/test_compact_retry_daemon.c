@@ -10,18 +10,20 @@
 #undef cuvs_cagra_serialize
 #include <assert.h>
 
-extern CuvsCagraIndex cuvs_cagra_compact(CuvsCagraIndex,const uint32_t*,int64_t,uint32_t,int,int*);
+extern CuvsCagraIndex cuvs_cagra_compact(CuvsCagraIndex,const uint32_t*,int64_t,uint32_t,int,int,int,int*);
 extern int cuvs_cagra_serialize(CuvsCagraIndex,const char*,int);
 static int retry_dtype, merge_fails, persist_fails, merge_calls;
 
 CuvsCagraIndex fixture_compact(CuvsCagraIndex ix,const uint32_t *bits,
-    int64_t n,uint32_t metric,int dev,int *retry)
+    int64_t n,uint32_t metric,int gd,int igd,int dev,int *retry)
 {
     ++merge_calls;
     assert(n==4 && bits[0]==13);
+    /* #261: the merge gets the graph degrees the COMPACT frame carried. */
+    assert(gd==3 && igd==5);
     *retry=retry_dtype;
     if (merge_fails) return NULL;
-    return cuvs_cagra_compact(ix,bits,n,metric,dev,NULL);
+    return cuvs_cagra_compact(ix,bits,n,metric,gd,igd,dev,NULL);
 }
 int fixture_serialize(CuvsCagraIndex ix,const char *path,int dev)
 {
@@ -62,7 +64,8 @@ static void run_case(int dtype,int fail_merge,int fail_persist)
     int sv[2];assert(socketpair(AF_UNIX,SOCK_STREAM,0,sv)==0);
     char dirbuf[256]={0};snprintf(dirbuf,sizeof(dirbuf),"%s",dir);
     assert(cuvs_fd_send(sv[0],-1,dirbuf,sizeof(dirbuf))==0);
-    CuvsCmdFrame cmd={.op=CUVS_OP_COMPACT,.db_oid=1,.index_oid=2};
+    CuvsCmdFrame cmd={.op=CUVS_OP_COMPACT,.db_oid=1,.index_oid=2,.graph_degree=3,
+                      .intermediate_graph_degree=5};
     handle_compact(sv[1],&cmd);
     CuvsReplyHeader hdr;assert(recv_all(sv[0],&hdr,sizeof(hdr))==0);
     assert(merge_calls==1);
@@ -73,11 +76,14 @@ static void run_case(int dtype,int fail_merge,int fail_persist)
         assert(file_bytes(tomb,new_tomb,sizeof(new_tomb))==tomb_size && !memcmp(old_tomb,new_tomb,tomb_size));
     } else if(fail_persist) {
         assert(hdr.status==CUVS_STATUS_PERSIST_FAILED);
-        assert(e->handle!=old_handle && e->n_vecs==3 && e->compact_count==1 && !e->file_current);
+        assert(e->handle==old_handle && e->tids==old_tids && e->n_vecs==4 && e->compact_count==0);
+        assert(e->file_current && e->compact_save_pending);
+        assert(file_bytes(index_path,new_disk,sizeof(new_disk))==old_size && !memcmp(old_disk,new_disk,old_size));
         assert(access(tomb,F_OK)==0);
         printf("OBSERVATION persist failure after retry: notice_empty=%d old_handle_retained=%d tombstone_retained=1\n",!hdr.notice_out[0],e->handle==old_handle);
     } else {
         assert(hdr.status==CUVS_STATUS_OK && e->n_vecs==3 && e->compact_count==1 && e->file_current);
+        assert(e->graph_degree==3);
         assert(e->tids[0]==101 && e->tids[1]==103 && e->tids[2]==104);
         assert(access(tomb,F_OK)!=0);
     }

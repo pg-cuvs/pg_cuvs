@@ -360,6 +360,67 @@ static unsigned fold_calls;
 static size_t expected_host_charge;
 static CuvsCagraFoldStatus fold_device_status;
 
+#ifdef CUVS_PAGE_OVERLAY_GPU
+static unsigned overlay_reclaims;
+
+bool
+cuvs_page_overlay_gpu_reclaim(int device)
+{
+    assert(device == 1 && pthread_mutex_trylock(&g_index_mutex) == 0);
+    CHECK(g_page_gpu_host_fold_device == 0 && g_page_gpu_host_fold_order == 11 &&
+          g_page_gpu_live[1] == MiB);
+    g_page_gpu_live[1] = 0;
+    g_max_vram_per_gpu[0] = 32 * MiB;  /* changed after the host-pressure hold */
+    ++overlay_reclaims;
+    pthread_mutex_unlock(&g_index_mutex);
+    return true;
+}
+
+static void
+test_gpu_host_retry_vram(bool other_ready)
+{
+    PageCagraGraph parent = {.n_slots = 512, .dim = 32, .index_oid = 31, .registered_order = 11,
+        .overlay = {.boot_id = 9, .covered_upto = 100}};
+    PageCagraGraph other = parent;
+
+    reset(CUVS_HNSW_OVERFLOW_ERROR, 0);
+    g_n_gpus = 2;
+    parent.handle = &parent;
+    if (other_ready)
+    {
+        parent.fold_retry_after = UINT64_MAX;
+        parent.next = &other;
+        other.handle = &other;
+        other.index_oid = 32;
+        other.registered_order = 12;
+    }
+    g_page_graphs = &parent;
+    g_page_gpu_min_rows = 1;
+    g_page_gpu_host_fold_device = 0;
+    g_page_gpu_host_fold_order = parent.registered_order;
+    g_page_gpu_live[1] = MiB;
+    overlay_reclaims = 0;
+    page_fold_run(0);
+    CHECK(overlay_reclaims == 1 && g_page_gpu_live[1] == 0);
+    if (other_ready)
+    {
+        CHECK(other.fold_retry_after > 0);
+        CHECK(g_page_gpu_host_fold_device == 0);
+        CHECK(g_page_gpu_host_fold_order == parent.registered_order);
+        parent.fold_retry_after = 0;
+        other.fold_retry_after = 0;
+        other.last_search = time(NULL);
+        other.hits = 100;  /* ordinary selection would pick this graph again */
+        page_fold_run(0);
+        CHECK(other.fold_retry_after == 0);
+    }
+    CHECK(parent.fold_retry_after > 0 && fold_calls == 0);
+    CHECK(g_page_gpu_host_fold_device == -1);
+    CHECK(!g_pending_build_vram[0] && !g_fold_active[0]);
+    g_page_graphs = NULL;
+}
+#endif
+
 int
 fixture_fold_shape(CuvsCagraIndex handle, CuvsCagraFoldShape *shape)
 {
@@ -386,6 +447,25 @@ fixture_fold_call(CuvsCagraIndex source, const float *added, int64_t rows, int d
     return fold_device_status;
 }
 
+static CuvsPageOverlayChunk *
+attach_fold_host_overlay(PageCagraGraph *parent, const CuvsPageOverlayRequest *request,
+                         size_t published_bytes)
+{
+    CuvsPageOverlayChunk *chunk;
+
+    assert(cuvs_page_overlay_alloc(&g_page_overlay_budget, request, published_bytes,
+                                   &chunk) == CUVS_STATUS_OK);
+    memset(chunk->marks, 0, published_bytes);
+    for (uint32_t i = 0; i < request->positions; ++i)
+        chunk->marks[i] = (CuvsPagePosition) {.block = 1, .state = CUVS_PAGE_POSITION_VECTOR};
+    *parent = (PageCagraGraph) {.n_slots = 512, .dim = 32, .db_oid = 2, .index_oid = 31,
+        .system_identifier = 1, .index_nonce = 5, .base_nonce = 8, .graph_nonce = 8,
+        .overlay = {.boot_id = 9, .covered_upto = request->positions, .head = chunk},
+        .handle = parent};    /* the fold fixture never dereferences the parent handle */
+    g_page_graphs = parent;
+    return chunk;
+}
+
 static void
 test_fold_host_charge(void)
 {
@@ -395,21 +475,13 @@ test_fold_host_charge(void)
     size_t staging_bytes = vectors + request.positions;
     size_t mirrors = (512 + request.positions) * (32 + 64) * sizeof(float);
     CuvsPageOverlayChunk *chunk;
-    PageCagraGraph parent = {.n_slots = 512, .dim = 32, .db_oid = 2, .index_oid = 31,
-        .system_identifier = 1, .index_nonce = 5, .base_nonce = 8, .graph_nonce = 8,
-        .overlay = {.boot_id = 9, .covered_upto = request.positions}};
+    PageCagraGraph parent;
 
     reset(CUVS_HNSW_OVERFLOW_ERROR, 0);
     g_n_gpus = 1;
     expected_host_charge = sizeof(*chunk) * 2 + published_bytes + staging_bytes + mirrors;
     g_page_overlay_budget.limit = expected_host_charge - 1;
-    assert(cuvs_page_overlay_alloc(&g_page_overlay_budget, &request, published_bytes, &chunk) == CUVS_STATUS_OK);
-    memset(chunk->marks, 0, published_bytes);
-    for (uint32_t i = 0; i < request.positions; ++i)
-        chunk->marks[i] = (CuvsPagePosition) {.block = 1, .state = CUVS_PAGE_POSITION_VECTOR};
-    parent.overlay.head = chunk;
-    parent.handle = &parent;    /* the fixture never dereferences the handle */
-    g_page_graphs = &parent;
+    chunk = attach_fold_host_overlay(&parent, &request, published_bytes);
     page_fold_run(0);
     CHECK(fold_calls == 0 && g_page_overlay_budget.used == chunk->charged_bytes);
 
@@ -439,6 +511,99 @@ test_fold_host_charge(void)
     g_page_graphs = NULL;
     cuvs_page_overlay_release(chunk);
     CHECK(g_page_overlay_budget.used == 0);
+}
+
+static void
+test_fold_cache_allocation_pressure(bool staging_pressure, bool optimized)
+{
+    const CuvsPageOverlayRequest request = {.positions = 100, .vector_rows = 100};
+    const size_t vectors = request.positions * 32 * sizeof(float);
+    const size_t published_bytes = vectors + request.positions * sizeof(CuvsPagePosition);
+    const size_t overlay_charge = sizeof(CuvsPageOverlayChunk) + published_bytes;
+    const size_t staging_charge = sizeof(CuvsPageOverlayChunk) + vectors + request.positions;
+    const size_t graph_bytes = 612 * 64 * sizeof(uint32_t);
+    const size_t retained = graph_bytes + 612 * 32 * sizeof(float);
+    const size_t mirror_charge = optimized ? graph_bytes : retained;
+    const size_t shortfall = staging_pressure ? sizeof(uint32_t) : 0;
+    const size_t idle_charge = mirror_charge + shortfall;
+    const size_t saved_limit = g_page_overlay_budget.limit;
+    const int saved_gpus = g_n_gpus;
+    const uint32_t saved_batch_rows = g_page_fold_batch_rows;
+    const unsigned calls_before = fold_calls;
+    const CuvsCagraFoldStatus saved_fold_status = fold_device_status;
+    PageFoldHostGraphCache cache = {.expires_us = UINT64_MAX};
+    PageCagraGraph parent;
+
+    reset(CUVS_HNSW_OVERFLOW_ERROR, 0);
+    g_n_gpus = 2;
+    g_page_fold_batch_rows = optimized ? request.positions : 0;
+    assert(!g_page_overlay_budget.used && !g_page_fold_idle_cache[0].graph
+           && !g_page_fold_idle_cache[1].graph);
+    assert(!g_page_graphs && !g_page_graph_bytes[0] && !g_page_graph_bytes[1]);
+
+    /* GPU 0 already has its shared overlay. Seed the exact GPU 1 cache
+     * charge by leaving no room for the cache allocator's spare capacity. */
+    g_page_overlay_budget.limit = overlay_charge + idle_charge;
+    CuvsPageOverlayChunk *chunk = attach_fold_host_overlay(&parent, &request, published_bytes);
+    assert(cuvs_page_overlay_valid(chunk, request.vector_rows, true));
+    assert(page_fold_host_graph_grow(&cache, idle_charge) && cache.bytes == idle_charge);
+    const uint64_t epoch = g_page_fold_cache_epoch;
+    page_fold_host_graph_return(1, &cache, epoch);
+    assert(!cache.graph && g_page_fold_idle_cache[1].graph);
+    CHECK(g_page_overlay_budget.used == overlay_charge + idle_charge);
+
+    /* Before reclaim, mirror pressure leaves exactly enough space for
+     * staging and zero for the fallback mirror. Stage pressure leaves
+     * one graph word less than the staging allocation itself. */
+    expected_host_charge = overlay_charge + staging_charge + mirror_charge;
+    g_page_overlay_budget.limit = expected_host_charge;
+    CHECK(g_page_overlay_budget.limit - g_page_overlay_budget.used == staging_charge - shortfall);
+    fold_device_status = CUVS_CAGRA_FOLD_OK;
+    page_fold_run(0);
+
+    CHECK(parent.fold_retry_after && !parent.fold_pins);
+    CHECK(parent.overlay.head == chunk && chunk->refs == 1);
+    CHECK(parent.overlay.covered_upto == request.positions && parent.folded == 0);
+    CHECK(!g_fold_claim[0] && !g_pending_build_vram[0] && !g_fold_active[0]);
+    if (optimized)
+    {
+        CHECK(fold_calls == calls_before + 1);
+        CHECK(!g_page_fold_idle_cache[1].graph && !g_page_fold_idle_cache[1].bytes);
+        CHECK(g_page_fold_cache_epoch != epoch);
+        CHECK(g_page_overlay_budget.used == overlay_charge);
+        CHECK(parent.fold_candidate && g_page_graph_bytes[0] == retained);
+        if (parent.fold_candidate)
+        {
+            const PageCagraGraph *candidate = parent.fold_candidate;
+
+            CHECK(candidate->gpu == 0 && candidate->bytes == retained);
+            CHECK(candidate->n_slots == 612 && candidate->folded == request.positions);
+            CHECK(candidate->fold_event.positions == request.positions
+                  && candidate->fold_event.parent_graph_nonce == parent.graph_nonce);
+        }
+    }
+    else
+    {
+        CHECK(fold_calls == calls_before && !parent.fold_candidate && !g_page_graph_bytes[0]);
+        CHECK(g_page_fold_idle_cache[1].graph && g_page_fold_idle_cache[1].bytes == idle_charge);
+        CHECK(g_page_fold_cache_epoch == epoch);
+        CHECK(g_page_overlay_budget.used == overlay_charge + idle_charge);
+    }
+
+    pthread_mutex_lock(&g_index_mutex);
+    discard_page_fold_locked(&parent, "test");
+    pthread_mutex_unlock(&g_index_mutex);
+    release_retired_fold_graphs();
+    CHECK(!g_page_graph_bytes[0] && !g_page_graph_bytes[1]);
+    g_page_graphs = NULL;
+    page_fold_host_graph_release(&g_page_fold_idle_cache[0]);
+    page_fold_host_graph_release(&g_page_fold_idle_cache[1]);
+    cuvs_page_overlay_release(chunk);
+    CHECK(!g_page_overlay_budget.used);
+    g_page_overlay_budget.limit = saved_limit;
+    g_page_fold_batch_rows = saved_batch_rows;
+    g_n_gpus = saved_gpus;
+    fold_device_status = saved_fold_status;
 }
 
 static void
@@ -817,9 +982,86 @@ test_fold_dead_batch_without_base(void)
 
     assert(cuvs_page_overlay_alloc(&budget, &request, bytes, &chunk) == CUVS_STATUS_OK);
     memset(chunk->marks, 0, bytes);
-    CHECK(page_fold_copy_rows(chunk, 0, request.positions, 1, vectors, live, false) == 0);
+    CHECK(page_fold_copy_rows(chunk, 0, request.positions, 1, vectors, live, false, false) == 0);
+    CHECK(page_fold_copy_rows(chunk, 0, 1, 1, vectors, live, false, true) == 0);
     cuvs_page_overlay_release(chunk);
     CHECK(budget.used == 0);
+}
+
+static void
+test_fold_dead_prefix_with_live_suffix(void)
+{
+    CuvsPageOverlayBudget budget = {.limit = 4096};
+    const CuvsPageOverlayRequest first = {.positions = 1};
+    const CuvsPageOverlayRequest rest = {.from = 1, .positions = 2};
+    CuvsPageOverlayChunk *prefix, *suffix;
+    const float sample = 42.0f;
+    float row = -1;
+    unsigned char live = 0;
+
+    assert(cuvs_page_overlay_alloc(&budget, &first, sizeof(CuvsPagePosition), &prefix) == CUVS_STATUS_OK);
+    assert(cuvs_page_overlay_alloc(&budget, &rest, 2 * sizeof(CuvsPagePosition) + sizeof(sample),
+                                   &suffix) == CUVS_STATUS_OK);
+    prefix->marks[0] = (CuvsPagePosition) {.state = CUVS_PAGE_POSITION_DEAD};
+    suffix->marks[0] = (CuvsPagePosition) {.state = CUVS_PAGE_POSITION_DEAD};
+    suffix->marks[1] = (CuvsPagePosition) {.block = 1, .state = CUVS_PAGE_POSITION_VECTOR};
+    memcpy(suffix->marks + 2, &sample, sizeof(sample));
+    suffix->next = prefix;
+
+    CHECK(page_fold_copy_rows(suffix, 0, 1, 1, &row, &live, false, false) == 0);
+    CHECK(page_fold_copy_rows(suffix, 0, 1, 1, &row, &live, false, true) == 1);
+    CHECK(live == 1 && row == sample);
+    cuvs_page_overlay_release(suffix);
+    CHECK(budget.used == 0);
+}
+
+static void
+test_fold_cache_supply_pressure(void)
+{
+    CuvsPageOverlayRequest request = {.positions = 1, .vector_rows = 1};
+    CuvsPageOverlayChunk *chunk = NULL;
+    const CuvsPagePosition mark = {.block = 1, .state = CUVS_PAGE_POSITION_VECTOR};
+    const float sample = 42.0f;
+    const size_t bytes = sizeof(mark) + sizeof(sample);
+    PageFoldHostGraphCache cache = {0};
+    const uid_t saved_peer = g_peer_uid;
+
+    reset(CUVS_HNSW_OVERFLOW_ERROR, 0);
+    g_page_fold_batch_rows = 1;
+    g_page_overlay_budget.limit = 1024;
+    g_peer_uid = geteuid();
+    snprintf(request.supplement_shm, sizeof(request.supplement_shm),
+             "/fold-supply-pressure-%ld", (long) getpid());
+    int fd = shm_open(request.supplement_shm, O_RDWR | O_CREAT | O_EXCL, 0600);
+    assert(fd >= 0 && write(fd, &mark, sizeof(mark)) == sizeof(mark) &&
+           write(fd, &sample, sizeof(sample)) == sizeof(sample));
+    close(fd);
+
+    /* A retained but idle mirror is reclaimable by the real supply read. */
+    assert(page_fold_host_graph_grow(&cache, 1024));
+    page_fold_host_graph_return(0, &cache, g_page_fold_cache_epoch);
+    CHECK(!cache.graph && g_page_fold_idle_cache[0].graph);
+    CHECK(read_page_overlay_chunk(&request, 1, true, &chunk) == CUVS_STATUS_OK);
+    CHECK(!g_page_fold_idle_cache[0].graph && g_page_overlay_budget.used == sizeof(*chunk) + bytes);
+    CHECK(chunk && memcmp(chunk->marks + 1, &sample, sizeof(sample)) == 0);
+    cuvs_page_overlay_release(chunk);
+    page_fold_host_graph_release(&g_page_fold_idle_cache[0]);
+
+    /* The supply may not take a mirror while a producer borrows it. Its
+     * retirement on completion frees space for the next supply. */
+    assert(page_fold_host_graph_grow(&cache, 1024));
+    page_fold_host_graph_return(0, &cache, g_page_fold_cache_epoch);
+    uint64_t epoch = page_fold_host_graph_take(0, &cache);
+    CHECK(read_page_overlay_chunk(&request, 1, true, &chunk) == CUVS_STATUS_PAGE_OVERLAY_HOST_FULL);
+    CHECK(!chunk && cache.graph && g_page_overlay_budget.used == 1024);
+    page_fold_host_graph_return(0, &cache, epoch);
+    CHECK(!cache.graph && !g_page_fold_idle_cache[0].graph && !g_page_overlay_budget.used);
+    CHECK(read_page_overlay_chunk(&request, 1, true, &chunk) == CUVS_STATUS_OK);
+    cuvs_page_overlay_release(chunk);
+    shm_unlink(request.supplement_shm);
+    CHECK(!g_page_overlay_budget.used);
+    g_page_fold_batch_rows = 0;
+    g_peer_uid = saved_peer;
 }
 
 static PageCagraGraph *
@@ -1254,6 +1496,27 @@ main(int argc, char **argv)
             test_extend_after_wait(false, true);
         else if (strcmp(argv[1], "build-rmm-phys-limit") == 0)
             test_build_rmm_phys_limit();
+        else if (strcmp(argv[1], "fold-dead-prefix") == 0)
+            test_fold_dead_prefix_with_live_suffix();
+        else if (strcmp(argv[1], "fold-cache-supply") == 0)
+            test_fold_cache_supply_pressure();
+        else if (strcmp(argv[1], "fold-cache-mirror") == 0)
+        {
+            test_fold_cache_allocation_pressure(false, false);
+            test_fold_cache_allocation_pressure(false, true);
+        }
+        else if (strcmp(argv[1], "fold-cache-staging") == 0)
+        {
+            test_fold_cache_allocation_pressure(true, false);
+            test_fold_cache_allocation_pressure(true, true);
+        }
+#ifdef CUVS_PAGE_OVERLAY_GPU
+        else if (strcmp(argv[1], "gpu-host-retry-vram") == 0)
+        {
+            test_gpu_host_retry_vram(false);
+            test_gpu_host_retry_vram(true);
+        }
+#endif
         else
             return 2;
         goto done;
@@ -1286,7 +1549,13 @@ main(int argc, char **argv)
     test_shard_fallback_wait(true);
     test_shard_fallback_wait(false);
     test_fold_dead_batch_without_base();
+    test_fold_dead_prefix_with_live_suffix();
+    test_fold_cache_supply_pressure();
     test_fold_host_charge();
+    test_fold_cache_allocation_pressure(false, false);
+    test_fold_cache_allocation_pressure(false, true);
+    test_fold_cache_allocation_pressure(true, false);
+    test_fold_cache_allocation_pressure(true, true);
     test_build_combined_device(false, false);
     test_build_combined_device(true, false);
     test_build_combined_device(false, true);
