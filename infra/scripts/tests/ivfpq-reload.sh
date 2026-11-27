@@ -85,7 +85,11 @@ fi
 stop_daemon
 
 artifact_bytes=$(stat -c '%s' "$artifact")
-needed=$("$estimate_bin" "$artifact")
+if [[ ${1:-} == --shim ]]; then
+    needed=$artifact_bytes
+else
+    needed=$("$estimate_bin" "$artifact")
+fi
 cagra_bytes=$((8192 * (4 * 128 + 4 * 64)))
 budget_mb=5
 budget_bytes=$((budget_mb * 1024 * 1024))

@@ -3429,6 +3429,11 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
             free(tids);
             goto done;
         }
+#ifdef PGCUVS_CPU_SHIM
+        /* The CPU reference shim persists its own self-describing corpus, not
+         * cuVS serialization v4; its resident corpus is the persisted corpus. */
+        reload_bytes = (uint64_t) st.st_size;
+#else
         CuvsIvfPqResidentEstimate estimate;
         if (cuvs_ivfpq_estimate_resident_fd(ivfpq_fd, (uint64_t) st.st_size, &estimate) != 0)
         {
@@ -3438,6 +3443,7 @@ load_index(uint32_t db_oid, uint32_t index_oid, CuvsRequester rq)
             goto done;
         }
         reload_bytes = estimate.bytes;
+#endif
     }
     else
         /* CAGRA graph_degree is not persisted in .tids: use the default. */
