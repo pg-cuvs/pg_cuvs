@@ -1594,6 +1594,40 @@ EXTRA_CLEAN += test-connectivity
 
 test-unit: test-connectivity
 
+# #203: physical layout and classification of the cover descriptor (pure C, no PostgreSQL).
+# The mutation runner weakens each rule of src/cuvs_cover_format.h once and requires the test to fail.
+test-cover-format: test/unit/test_cover_format.c test/unit/test_cover_format_mutations.py src/cuvs_cover_format.h
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -Isrc test/unit/test_cover_format.c -o $@
+	./$@
+	$(CC) -std=c11 -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall -Wextra -Werror -Isrc test/unit/test_cover_format.c -o $@-san
+	./$@-san
+	python3 test/unit/test_cover_format_mutations.py --output $(or $(COVER_FORMAT_MUTATION_OUT),/tmp/pgcuvs-cover-format-mutations)
+
+EXTRA_CLEAN += test-cover-format test-cover-format-san
+.PHONY: test-cover-format
+
+test-cover-reach: test/unit/test_cover_reach.c test/unit/test_cover_reach_mutations.py src/cuvs_cover_reach.h
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -Isrc test/unit/test_cover_reach.c -o $@
+	./$@
+	$(CC) -std=c11 -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall -Wextra -Werror -Isrc test/unit/test_cover_reach.c -o $@-san
+	./$@-san
+	python3 test/unit/test_cover_reach_mutations.py --output $(or $(COVER_REACH_MUTATION_OUT),/tmp/pgcuvs-cover-reach-mutations)
+
+EXTRA_CLEAN += test-cover-reach test-cover-reach-san
+.PHONY: test-cover-reach
+
+test-cover-ledger: test/unit/test_cover_ledger.c test/unit/test_cover_ledger_mutations.py src/cuvs_cover_ledger.h src/cuvs_cover_format.h
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -Isrc test/unit/test_cover_ledger.c -o $@
+	./$@
+	$(CC) -std=c11 -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall -Wextra -Werror -Isrc test/unit/test_cover_ledger.c -o $@-san
+	./$@-san
+	python3 test/unit/test_cover_ledger_mutations.py --output $(or $(COVER_LEDGER_MUTATION_OUT),/tmp/pgcuvs-cover-ledger-mutations)
+
+EXTRA_CLEAN += test-cover-ledger test-cover-ledger-san
+.PHONY: test-cover-ledger
+
+test-unit: test-cover-format test-cover-reach test-cover-ledger
+
 # Explicit exact scans of pg_cuvs_hnsw on a real PostgreSQL 16 backend (CPU only, no
 # daemon). The four scripts need a disposable cluster that preloads pg_cuvs, with the
 # vector and pg_cuvs extensions created in HNSW_EXACT_DB; they create their own schemas
