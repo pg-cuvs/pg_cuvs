@@ -271,3 +271,73 @@ SELECT index_name, resident, search_count, last_status
 관련: `daemon-restart-recovery.md`, `persistence-corruption-recovery.md`.  
 설계 근거: `pg_cuvs.control(default_version=0.9.3)`,
 `test/sql/upgrade_path.sql`, Makefile `install` / `install-server` 타겟.
+
+---
+
+## 7. Upgrading 0.9.2 to 0.9.3 (cover guarantee)
+
+**Status: Unverified for release; Current / Verified only for the steps tagged
+"executed" below.** 0.9.3 is not released. The executed steps come from
+`test/unit/test_downgrade_pg.py` (this repository's test runner, run on a relocated
+PostgreSQL 16.15 cluster); the other runners for this feature are
+`test/unit/test_rollback_hazards_pg.py` and `test/unit/test_cover_breakglass_pg.py`.
+This section names them; it does not record a run of them at the time of writing. The
+`pg_cuvs_hnsw` indexes in those tests were created by switching the access method of a
+pgvector `hnsw` index in the catalog; they are not GPU-built indexes. What was not run is
+listed in section 7.5 and in "Not verified" of
+[rollback-and-cleanup.md](rollback-and-cleanup.md) section 6.4.
+
+0.9.3 adds the cover guarantee for `pg_cuvs_hnsw` indexes: a cover descriptor in the
+metapage and a ledger of keys on extra pages (see `CHANGELOG.md`). Its SQL moves the
+access method handler to a new C symbol, `pg_cuvs_hnsw_handler_c1p`, which the 0.9.2
+library does not export. That is why the order below matters.
+
+### 7.1 Order
+
+1. Install the package. The running server still uses the old code.
+2. **Restart the server. The restart is mandatory.** Installing without restarting leaves
+   the postmaster on the library image it already loaded, and every new backend keeps using
+   it (executed: `test_downgrade_pg.py`, case S4).
+3. In every database, run `ALTER EXTENSION pg_cuvs UPDATE;`. The extension version is per
+   database, so a cluster with several databases needs one update in each.
+4. Indexes built before 0.9.3 stay LEGACY: they carry no cover descriptor and have no
+   guarantee. Only indexes built from 0.9.3 on carry one.
+
+Check the result in each database:
+
+```sql
+SELECT extversion FROM pg_extension WHERE extname = 'pg_cuvs';   -- 0.9.3
+SELECT pg_cuvs_hnsw_cover_status('schema.index_name'::regclass);
+```
+
+### 7.2 `shared_preload_libraries`
+
+`pg_cuvs` must be in `shared_preload_libraries`. Without it the library cannot be loaded and
+`CREATE EXTENSION pg_cuvs` fails with `FATAL: cannot create PGC_POSTMASTER variables after
+startup` (executed: `test_downgrade_pg.py`, case S0). This is not a new requirement of
+0.9.3; the current library already needs it.
+
+### 7.3 `ALTER EXTENSION UPDATE` run before the restart
+
+Executed: `test_downgrade_pg.py`, case S4.
+
+- Symptom: `ERROR: could not find function "pg_cuvs_hnsw_handler_c1p" in file
+  ".../pg_cuvs.so"`.
+- Effect: none. The update script runs in one transaction, so the extension stays at 0.9.2
+  with the old handler symbol, and tables stay readable and writable.
+- Recovery: restart the server, then run the same `ALTER EXTENSION` again.
+
+### 7.4 Connection pools
+
+After the update, reconnect every pooled connection. A session opened before
+`ALTER EXTENSION pg_cuvs UPDATE` keeps the old index routine in its relation cache, and a
+`REINDEX` run from such a session builds the index as LEGACY again (executed in an
+independent review, script `st1.sh`; it is not one of the three test runners).
+
+### 7.5 Not run for this procedure
+
+- Indexes that the GPU built over a table that already had rows (the test environment has
+  no CAGRA daemon), and a `pg_dump` restore of such a table.
+- A cluster whose databases are at different steps of this procedure.
+- Platforms other than Linux with glibc, for "a replaced file is not used until the
+  restart".

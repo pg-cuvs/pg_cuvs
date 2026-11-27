@@ -1473,6 +1473,106 @@ pgvector 0.8.7 on PostgreSQL 16 only. If a pgvector version does not copy the or
 operators, the exact scan stops with the first-fetch error above instead of returning
 rows.
 
-CPU PostgreSQL 16 regressions cover this explicit mode (`make test-hnsw-exact-pg`). Automatic
-recovery of unreachable rows in the default configuration, native/GPU runs and large-scale
-performance qualification are not done (#203 stays open).
+CPU PostgreSQL 16 regressions cover this explicit mode (`make test-hnsw-exact-pg`). The automatic
+recovery described in the next section is a separate mechanism that works without this setting.
+
+### Cover guarantee for pg_cuvs_hnsw (#203, extension 0.9.3)
+
+**Status: current for CPU PostgreSQL 16 with pgvector 0.8.7 (regressions `test/unit/test_cover_*_pg.py`, see
+"Not verified" below). This does not close #203: it bounds which rows a search can lose, it does not make an approximate
+graph exact.**
+
+A `pg_cuvs_hnsw` graph can contain rows that no path from the entry point reaches (#203: a clustered table can lose
+recall almost entirely). An index created under 0.9.3 therefore carries a *cover descriptor* in its metapage and a *ledger*
+of heap TIDs on pages outside the graph chain. A search of a certified index combines the graph's answers with every ledger
+key and ranks the merged set by exact distance over MVCC-visible heap rows.
+
+**What is guaranteed.** Rows the graph could not reach at the last certification, and every row inserted after it, are
+always candidates of a search of that index. A row that was reachable at the last certification and that a later insert cuts
+off from the graph is outside the guarantee until the next recertification. How many rows that is depends on the graph's degree and on the data (measured below:
+none to 1.4 percent of the original rows on a strongly clustered test table); a plain pgvector index loses rows to its inserts in the same way, and has no ledger that would still return them. The next recertification is made by the
+cleanup step of a `VACUUM` (once the keys since the certification pass 5 percent of the rows it covered, and after a `VACUUM` that removed rows took the index off), by `pg_cuvs_cover_recertify()`, or by `REINDEX`.
+"Last certification" means the moment the recertification *started* (the instant it holds the cover lock exclusively and
+no insert is in flight). The walk is not a snapshot: it reads the pages one after the other while inserts go on. Inserts that run while it walks the graph count as
+later inserts, and a row such an insert cuts off from the graph, after the walk counted it as reached, is
+outside the guarantee until the next recertification. `certified_at` in the status function is that instant.
+
+**What this costs while no recertification runs.** Every insert adds one key to the ledger, and every search of a certified index reads the whole ledger and
+ranks its rows exactly, so the time of a search grows with the number of inserts since the last certification. Measured (100,000 rows of 96 dimensions, warm cache, the
+ledger at 0.03, 0.3 and 3 percent of the rows): the 95th percentile of a search is 1.03, 1.04 and 1.47 times that of an index with no ledger keys. `keys_since_certification`
+and `recertify_recommended` (set once the keys pass 5 percent of the rows the certification covered) in the status function show it.
+How often inserts cut a row off depends on the graph's degree m: a stress graph with m = 4 lost 1 to 85 rows per round of a few thousand inserts; graphs with m of 8 or more lost none in
+89,282 inserts (an independent review, CPU-built graphs); and a 300,000-row table of random 96-dimensional vectors with m = 32 (the m of a graph converted from a CAGRA graph of degree 64) lost 8 rows (0.0027 percent)
+when inserts doubled it, against 6 for the same table built and filled by pgvector alone. Random vectors are not clustered. On a strongly clustered table (20,000 rows of 8 dimensions in 50 clusters, noise 0.05, m = 32,
+ef_construction = 64, four sessions inserting, counted from the state right after the build, without a recertification in between), the product (pgvector's bulk build, the index
+switched to `pg_cuvs_hnsw`, the inserts made through it) and pgvector alone were each run six times with this repository's tool (`test/unit/measure_insert_disconnect.py --case
+clusters:20000x8/50/0.05 --m 32 --ef-construction 64 --writers 4 --switch`, different seeds) and six times by an independent review with its own script (the same table shape and counting, noise from
+`random()`). Twelve runs of each kind: the product cut off 0 to 278 of the 20,000 original rows (0 to 1.4 percent) in about 15,000 inserts and 0 to 278 in about 44,000; pgvector alone cut off 0 to 136 and 0 to 296.
+The tool's six runs gave the product 0, 173, 0, 278, 0, 0 and 22, 173, 24, 278, 62, 0, and pgvector alone 2 to 136 and 14 to 296; the review's six gave the product 0 to 11 and 0 to 50, and pgvector alone 0 to 62 and 0 to 62
+(0 in four of its six runs at 15,000 inserts, the tool's runs in none). The two measurements put the runs in different places of these ranges and why is not established, so no end of a range is a bound. In both, the ranges of
+the two kinds overlap, and the measurements do not tell the two kinds apart: they neither show that the product cuts off as few rows as pgvector alone nor that it cuts off more. An independent review counted per recertification window on the product, same table shape and m, and found 14 cut-off rows in 15,443 inserts and 47 in 44,123 (about 0.1 percent of the inserted rows).
+Not measured: graphs converted from a GPU-built CAGRA graph over existing rows, other data shapes.
+
+**What is not guaranteed.** Recall of the rows the graph does reach is still that of the finite-ef approximate search
+(the merged candidates are ranked exactly, but the graph supplies only part of them). "Reached" means that a path of neighbour slots of any layer leads to the
+row from the entry point, which is what pgvector's search does: it descends through the upper layers and starts layer 0 where the descent ends. Counting layer 0's slots alone would
+list most of a clustered graph as unreachable (measured on 20,000 rows of 16 dimensions: 14,500 of them at m = 16, and an ordered scan by the row's own vector found all 200 sampled). The cost of the
+wider definition: a row that only an upper-layer slot leads to is not in the ledger, and a search finds it only when its descent ends on it. Graphs of m = 8 or more built from random
+vectors had no such row; at m = 4 there were 30 in 20,000 and an ordered scan by their own vectors found one of them (`test/unit/measure_upper_layer_reach.py`). Indexes built before 0.9.3 (class
+`legacy`) keep the old behavior. Indexes whose recertification failed, that a VACUUM changed since, or whose ledger does
+not read are answered from the heap (see the table), not from the graph. Row-level security, index expressions and partial
+indexes: an index with a descriptor on such a table or shape is refused with SQLSTATE `0A000` ("cannot run exactly"); this
+is the current behavior and is open for decision.
+
+**Index classes** (`pg_cuvs_hnsw_cover_status(index)->>'class'`) and what a scan does:
+
+| Class | Meaning | Scan |
+|---|---|---|
+| `certified` | the descriptor is valid and its ledger reads | graph answers merged with all ledger keys, ranked exactly; a ledger with no key is scanned as the plain graph |
+| `lost` | the guarantee was withdrawn (reason in `pending`: built without certification, a VACUUM changed the graph, rows inserted by an older library, a recertification gave up, a damaged ledger page, a downgrade, an emergency rollback) | exact ranking over the heap, with a NOTICE that names the reason and what certifies it again |
+| `untrusted` | the descriptor does not read, or was written by a newer pg_cuvs whose ledger this library cannot judge | exact ranking over the heap |
+| `off`, `legacy` | the descriptor says off, or the index was built before 0.9.3 and has none | as before 0.9.3 (approximate, no NOTICE) |
+| `not_built` | the index has no pages (what a failed `CREATE INDEX CONCURRENTLY` leaves) | not used; `DROP INDEX` or `REINDEX INDEX` it |
+
+**Writes.** An insert takes the index's cover lock in share mode, writes its ledger key (WAL-logged before the pgvector
+insert), runs the pgvector insert, and releases the lock. `VACUUM` takes a certified index to `lost` (reason vacuum) before
+pgvector changes the graph and recertifies it in the cleanup step. `CREATE INDEX` on an empty table starts `certified`; a build over
+rows certifies at its end, and a certification that cannot be made at the end of a build does not fail the build (the
+index stays `lost` with a NOTICE). `CREATE INDEX CONCURRENTLY` and `REINDEX INDEX CONCURRENTLY` on an empty table leave the index certified (tested on empty tables only).
+
+**Recertification.** `SELECT pg_cuvs_cover_recertify('idx')` (owner of the table) walks the graph without blocking
+inserts, writes a new ledger (rows the walk could not reach, then the keys of inserts that ran meanwhile) and publishes it
+with one WAL record. It waits for the cover lock in the lock manager's queue for at most `min(lock_timeout, 2 s)` and
+answers `deferred` if it cannot get the table and index locks without waiting. The walk gives way (`deferred`, nothing written) when another session starts to wait for a lock that conflicts with its table lock (`ALTER TABLE`, `DROP INDEX`, `REINDEX`), so that the statement, and every reader and writer queued behind it, does not wait for the whole walk. VACUUM does the same work, without giving way; a ledger that
+does not read is rebuilt by it too. The walk's memory limit is taken from `maintenance_work_mem`; beyond it the walk may use an unlinked spill file (at most half of the
+free disk space, none under a finite `temp_file_limit`). A walk that does not fit leaves a `last_recertification_failure` in the
+status, and VACUUM does not retry it at the same relation size and limit. A recertification that is abandoned, deferred or cancelled after it wrote its new ledger pages leaves them as free pages for the next one (`reclaimed_pages` in its answer): repeated attempts do not grow the index. The answer of `pg_cuvs_cover_recertify` also has `reused_pages`, the phase times and the memory it used.
+
+**Functions.** `pg_cuvs_hnsw_cover_status(index regclass) -> jsonb` (needs SELECT on the table): `class`, `writable`,
+`guarantee_in_force`, `guarantee` (only while in force), `certified_at`, `generation`, `base_rows`, `base_unreached`,
+`ledger_keys`, `ledger_ok`, `ledger_problem`, `keys_since_certification`, `recertify_recommended`, `pending`,
+`last_recertification_failure`, `handler_symbol`, `stored_reason`, `breakglass_marker`. `pg_cuvs_cover_recertify(index regclass) -> jsonb`:
+`result` is `done`, `not_applicable`, `deferred`, `failed`, `skipped` or `abandoned`, with `detail`. `pg_cuvs_cover_breakglass()`
+is the emergency action when the package has to go back to the older library while the SQL stays at 0.9.3 (superuser; see
+[rollback-and-cleanup](playbooks/rollback-and-cleanup.md)). `pg_cuvs_cover_invalidate_all()` is called by the
+`0.9.2--0.9.3` and `0.9.3--0.9.2` scripts and is not for direct use.
+
+**Measured cost** (CPU container, PostgreSQL 16.15, pgvector 0.8.7; one sample per cell unless stated):
+
+| What | Value |
+|---|---|
+| Read latency, 100,000 x 96, warm, 200 queries x 7 repeats, same index file merged vs ANN alone, p95 ratio | 1.03 at 30 ledger keys (0.03%), 1.04 at 300 (0.3%), 1.47 at 3,000 (3%, +1.87 ms); an independent run on a loaded host gave 1.11 to 1.42 |
+| One recertification (idle, `pg_cuvs_cover_recertify`) | 0.09 s at 100,000 rows; 0.71 s at 500,000 x 96, m = 32 (the walk is 0.70 s of it; the index file is 434 MiB) |
+| Exclusive cover lock of one recertification, 500,000 x 96 (`phase1_lock_us`, `phase3_lock_us` in the answer) | phase 1 0.14 ms, phase 3 0.01 ms; with a ledger of 25,099 keys (5 percent) 0.89 ms and 0.57 ms, because phase 1 reads the whole chain under the lock; with two sessions inserting in a loop 0.03 and 0.05 ms, and the longest insert statement of that time was 186.6 ms against a median of 174.1 ms before it |
+| Insert, 100,000 x 96, server CPU per row | within measurement noise of the plain pgvector index (ratio 0.97 to 1.00) |
+| Rows cut off by later inserts (not covered until the next recertification), random vectors, 300,000 x 96, product graph (metapage m = 32), +100% inserted | 8 rows (0.0027%); the same size with stock m = 16 on 100,000 rows gave 0.24 to 0.29% |
+| The same on a strongly clustered table (20,000 x 8, 50 clusters, noise 0.05, m = 32, ef_construction = 64, four inserting sessions, six runs of each kind), +75% and +220% inserted | twelve runs of each kind, two measurements (the repository's tool and the review): product 0 to 278 and 0 to 278 rows of the 20,000 (0 to 1.4%); pgvector alone 0 to 136 and 0 to 296; the two kinds are not told apart |
+
+The metapage `m` of a pg_cuvs_hnsw index is 32 (CAGRA `graph_degree` 64 gives `M0` 64); the `m` reloption is informational.
+Inserts prune neighbors with that `m` and with the `ef_construction` reloption (pgvector 0.8.7 `hnswinsert.c`).
+
+**Not verified.** GPU-built indexes over existing rows (the CPU environment has no CAGRA daemon), including
+`certify_after_build` failing and `CREATE/REINDEX INDEX CONCURRENTLY` over rows; read latency at 1M rows and above, at 768
+dimensions and with a cold cache; the exposure to cut-off rows on strongly clustered data of other shapes than the one table measured, and on graphs converted from a CAGRA graph; one backend `SIGBUS` seen once on a table of identical vectors that three
+attempts could not reproduce; a slow start of the server seen now and then under load (not reproduced, cause not established); recertification time above 500,000 rows (a 1,000,000-row build in the 5.9 GB test VM ended
+when the server was shut down immediately during the index build, cause not established, so the walk time at that size is not measured; 0.11 s at 100,000 and 0.70 s at 500,000 rows says it grows about with the row count, which is a trend and not a measurement).

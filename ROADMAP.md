@@ -71,6 +71,7 @@
 |-------|------|------|
 | **코스트 모델 v2 — 물리 분해 + 하드웨어-포터블 계수 (ADR-075)** | **Phase 1+2 구현·VM 검증 완료**(`feat/hw-profile`, ADR-075 Phase 2 구현절). Phase 1: 데몬 startup probe(`link_bw`/`hbm_bw`/`gpu_bf_tput`/`ipc_rtt` + v2 `cpu_dist_tput`/`gpu_cagra_lat_us`) → CRC sidecar(v2, 정체성 태그) → 플래너 싸게 read + `pg_cuvs_hw_profile()`. Phase 2: cagra/flat 비용을 κ=`cpu_operator_cost·cpu_dist_tput/dim` 앵커로 물리화(probe 비트 게이트; 미측정/Tier-1/`cuvs.enable_phys_cost=off`는 레거시 바이트 동일). A100 검증: dim8 N=10000에서 레거시는 seqscan·물리는 cagra(배포별 교차점 교정), N=2000 anti-flip. **남음(트리거)**: transient B 물리공식 활성 + `auto`(통합메모리 GH200/MI300A) | Phase1+2 done / B-auto 트리거 |
 | **filtered 교차점 + 런타임 적응 라우팅** | live `auto`의 전제: filtered wedge(B의 filter-first vs CPU exact-filtered) 교차점 측정 + 동시성/offload 런타임 신호. ADR-075 코스트 v2 위에서 (ADR-074/ADR-069/ADR-075) | 트리거 |
+| **#203 cover 보증 잔여 (0.9.3)** | 구현·CPU 검증 완료(ADR-090, `docs/reference.md` "Cover guarantee"). **미완: GPU 빌드 인덱스(행 있는 표, `certify_after_build` 실패, 행 있는 CONCURRENTLY/REINDEX), 100만 행 이상·768차원·차가운 캐시의 읽기 지연, 군집 데이터(이슈 원 사례)의 끊김 노출 측정, 재현하지 못한 백엔드 SIGBUS 1회, 부하에서 간헐적으로 느린 서버 시작, RLS·표현식·부분 인덱스 처리(사용자 결정 대기).** #203은 닫지 않는다 | 릴리스 전 |
 | **release-prep** | 벤치마크 공개·문서 정합성·운영 플레이북 완성. 현행 correctness 잔여 및 환경별 증거를 release readiness 표로 추적 | 기능 작업과 병행 |
 | circuit breaker 전역화 · SQL latency split | 운영 하드닝 잔여 (fallback 관측성은 PR #43 완료) | 트리거 |
 | 3N | OFFSET-aware K 자동 조정 (ORM pagination 호환) | 트리거 (ORM 요구) |

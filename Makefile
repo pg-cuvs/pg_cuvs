@@ -38,7 +38,8 @@ DATA           = sql/pg_cuvs--0.1.0.sql \
                  sql/pg_cuvs--0.9.1--0.9.2.sql \
                  sql/pg_cuvs--0.9.2.sql \
                  sql/pg_cuvs--0.9.2--0.9.3.sql \
-                 sql/pg_cuvs--0.9.3.sql
+                 sql/pg_cuvs--0.9.3.sql \
+                 sql/pg_cuvs--0.9.3--0.9.2.sql
 MODULE_big     = pg_cuvs
 REGRESS        = smoke upgrade_path cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge build_hnsw_halfvec build_hnsw_packing hnsw_insert_shift hnsw_layer_status hnsw_build_m hnsw_build_ef hnsw_source_conversion hnsw_source_maintenance hnsw_source_conversion_file pg_cuvs_hnsw metrics brute_force brute_force_after_extend brute_force_after_compact pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison prefilter_short_fill_guard ivfpq_smoke ivfpq_drop_release cagra_streaming cagra_dynbatch cagra_search_params auto_compact extend_vram_fallback stream_bf_recall fallback_stat vram_accounting build_lock flat_smoke transient_bf hw_profile routing_golden routing_golden_measured multi_vector daemon_uid_owner unordered_scan null_query_vector rmm_pool admission_reject compact_graph_degree compact_width_notice
 REGRESS_OPTS   = --inputdir=test --outputdir=test
@@ -83,7 +84,7 @@ ISOLATION_GPU  = pg_cuvs_hnsw_cic_writes
 # C source files + the CUDA-compiled wrapper (built below by nvcc).
 # PGXS only knows how to build .c → .o; the .cu → .o rule is custom,
 # but the resulting object MUST be listed in OBJS to be linked into the .so.
-OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o $(WRAPPER_OBJ) src/hnsw_export.o src/cuvs_hnsw_scan.o src/cuvs_hnsw_rls.o src/cuvs_hnsw_exact.o src/cuvs_build_corpus.o src/pg_cuvs_compaction.o src/cuvs_status_text.o src/cuvs_peak_meter.o src/cuvs_cagra_pages.o src/cuvs_cagra_pending_search.o src/cuvs_cagra_fold_worker.o
+OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o $(WRAPPER_OBJ) src/hnsw_export.o src/cuvs_hnsw_scan.o src/cuvs_hnsw_rls.o src/cuvs_hnsw_exact.o src/cuvs_build_corpus.o src/pg_cuvs_compaction.o src/cuvs_status_text.o src/cuvs_peak_meter.o src/cuvs_cagra_pages.o src/cuvs_cagra_pending_search.o src/cuvs_cagra_fold_worker.o src/cuvs_cover_admin.o src/cuvs_cover_reach_pg.o src/cuvs_cover_insert.o src/cuvs_cover_scan.o src/cuvs_cover_recert.o
 OBJS           += src/cuvs_cagra_history.o src/cuvs_cagra_resident_supply.o
 
 # nvcc settings (Phase 1: brute-force only; CAGRA added later)
@@ -1606,6 +1607,12 @@ test-cover-format: test/unit/test_cover_format.c test/unit/test_cover_format_mut
 EXTRA_CLEAN += test-cover-format test-cover-format-san
 .PHONY: test-cover-format
 
+# Handler symbol versioning (decision V+D): SQL, C symbols and the downgrade script agree. No PostgreSQL.
+test-cover-symbols: test/unit/test_cover_symbols.py src/hnsw_export.c sql/pg_cuvs--0.9.3.sql sql/pg_cuvs--0.9.2--0.9.3.sql sql/pg_cuvs--0.9.3--0.9.2.sql
+	python3 test/unit/test_cover_symbols.py $(if $(wildcard pg_cuvs.so),--library pg_cuvs.so)
+
+.PHONY: test-cover-symbols
+
 test-cover-reach: test/unit/test_cover_reach.c test/unit/test_cover_reach_mutations.py src/cuvs_cover_reach.h
 	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -Isrc test/unit/test_cover_reach.c -o $@
 	./$@
@@ -1626,7 +1633,95 @@ test-cover-ledger: test/unit/test_cover_ledger.c test/unit/test_cover_ledger_mut
 EXTRA_CLEAN += test-cover-ledger test-cover-ledger-san
 .PHONY: test-cover-ledger
 
-test-unit: test-cover-format test-cover-reach test-cover-ledger
+test-unit: test-cover-format test-cover-symbols test-cover-reach test-cover-ledger
+
+# Downgrade, rollback and upgrade order on real PostgreSQL 16 servers (CPU only, no daemon). Builds a private,
+# relocated copy of the installation and starts its own clusters; needs pgvector and a NEW and an OLD pg_cuvs.so
+# (the old one only exports pg_cuvs_hnsw_handler, e.g. a build of main before decision V+D).
+#   make test-downgrade-pg DOWNGRADE_OLD_LIB=/path/to/old/pg_cuvs.so
+# test-downgrade-mutations damages the SQL scripts one line at a time; the runner must fail for each.
+DOWNGRADE_OUT ?= /tmp/pgcuvs-downgrade-results
+DOWNGRADE_NEW_LIB ?= pg_cuvs.so
+.PHONY: test-downgrade-pg test-downgrade-mutations test-cover-build-pg test-cover-insert-pg test-rollback-hazards-pg test-cover-scan-pg test-cover-recert-pg test-cover-vacuum-pg test-cover-insert-order-pg test-cover-breakglass-pg test-cover-ledger-damage-pg test-cover-limits-pg test-cover-walk-pg test-cover-orphan-pg
+
+# What an ordered scan returns for an index with a cover descriptor, against PostgreSQL's own exact sort.
+test-cover-scan-pg:
+	@test -n "$(DOWNGRADE_OLD_LIB)" || { echo "set DOWNGRADE_OLD_LIB"; exit 2; }
+	python3 test/unit/test_cover_scan_pg.py --output $(DOWNGRADE_OUT)-scan --new-lib $(DOWNGRADE_NEW_LIB) --old-lib $(DOWNGRADE_OLD_LIB)
+
+# F6a: recertification (CPU only). DOWNGRADE_PAUSE_LIB is a build with -DCUVS_COVER_RECERT_TEST_PAUSE_US=3000000; without it C7 is not run.
+test-cover-recert-pg:
+	@test -n "$(DOWNGRADE_OLD_LIB)" || { echo "set DOWNGRADE_OLD_LIB"; exit 2; }
+	python3 test/unit/test_cover_recert_pg.py --output $(DOWNGRADE_OUT)-recert --new-lib $(DOWNGRADE_NEW_LIB) --old-lib $(DOWNGRADE_OLD_LIB) $(if $(DOWNGRADE_PAUSE_LIB),--pause-lib $(DOWNGRADE_PAUSE_LIB))
+
+# F6b: ambulkdelete takes the guarantee off, amvacuumcleanup recertifies (VACUUM, ANALYZE, autovacuum; CPU only).
+# DOWNGRADE_GATE_LIB: a build with -DCUVS_COVER_RECERT_TEST_GATE, which adds the check of the state in the middle of a VACUUM.
+test-cover-vacuum-pg:
+	@test -n "$(DOWNGRADE_OLD_LIB)" || { echo "set DOWNGRADE_OLD_LIB"; exit 2; }
+	python3 test/unit/test_cover_vacuum_pg.py --output $(DOWNGRADE_OUT)-vacuum --new-lib $(if $(DOWNGRADE_GATE_LIB),$(DOWNGRADE_GATE_LIB),$(DOWNGRADE_NEW_LIB)) --old-lib $(DOWNGRADE_OLD_LIB) $(if $(DOWNGRADE_GATE_LIB),--gate)
+
+# The emergency action and its marker: with the older library installed, back with the new one, the way out, dump/restore, pg_upgrade.
+test-cover-breakglass-pg:
+	@test -n "$(DOWNGRADE_OLD_LIB)" || { echo "set DOWNGRADE_OLD_LIB"; exit 2; }
+	python3 test/unit/test_cover_breakglass_pg.py --output $(DOWNGRADE_OUT)-breakglass --new-lib $(DOWNGRADE_NEW_LIB) --old-lib $(DOWNGRADE_OLD_LIB)
+
+# Damage to the ledger of a CERTIFIED index (a flipped bit in a key, a cut chain): what the status function and a scan say, and the recertification that heals it.
+test-cover-ledger-damage-pg:
+	@test -n "$(DOWNGRADE_OLD_LIB)" || { echo "set DOWNGRADE_OLD_LIB"; exit 2; }
+	python3 test/unit/test_cover_ledger_damage_pg.py --output $(DOWNGRADE_OUT)-ledger-damage --new-lib $(if $(DOWNGRADE_GATE_LIB),$(DOWNGRADE_GATE_LIB),$(DOWNGRADE_NEW_LIB)) --old-lib $(DOWNGRADE_OLD_LIB) $(if $(DOWNGRADE_GATE_LIB),--gate)
+
+# N-1: the ledger key reaches the WAL before the graph insert (pg_waldump); with DOWNGRADE_GATE_LIB also the crash between them.
+test-cover-insert-order-pg:
+	@test -n "$(DOWNGRADE_OLD_LIB)" || { echo "set DOWNGRADE_OLD_LIB"; exit 2; }
+	python3 test/unit/test_cover_insert_order_pg.py --output $(DOWNGRADE_OUT)-order --new-lib $(if $(DOWNGRADE_GATE_LIB),$(DOWNGRADE_GATE_LIB),$(DOWNGRADE_NEW_LIB)) --old-lib $(DOWNGRADE_OLD_LIB) $(if $(DOWNGRADE_GATE_LIB),--gate)
+
+# F4a: ledger keys written by the insert path, read back from the relation file (empty-table indexes; no GPU).
+test-cover-insert-pg:
+	@test -n "$(DOWNGRADE_OLD_LIB)" || { echo "set DOWNGRADE_OLD_LIB"; exit 2; }
+	python3 test/unit/test_cover_insert_pg.py --output $(DOWNGRADE_OUT)-insert --new-lib $(DOWNGRADE_NEW_LIB) --old-lib $(DOWNGRADE_OLD_LIB)
+
+# What an unplanned rollback does (symptoms, autovacuum, the wraparound vacuum, break-glass, resync), measured.
+test-rollback-hazards-pg:
+	@test -n "$(DOWNGRADE_OLD_LIB)" || { echo "set DOWNGRADE_OLD_LIB"; exit 2; }
+	python3 test/unit/test_rollback_hazards_pg.py --output $(DOWNGRADE_OUT)-hazards --new-lib $(DOWNGRADE_NEW_LIB) --old-lib $(DOWNGRADE_OLD_LIB)
+
+# F2b: the metapage a pg_cuvs_hnsw build writes (empty tables and the UNLOGGED init fork; builds over rows need the daemon).
+test-cover-build-pg:
+	@test -n "$(DOWNGRADE_OLD_LIB)" || { echo "set DOWNGRADE_OLD_LIB"; exit 2; }
+	python3 test/unit/test_cover_build_pg.py --output $(DOWNGRADE_OUT)-build --new-lib $(DOWNGRADE_NEW_LIB) --old-lib $(DOWNGRADE_OLD_LIB)
+
+# The memory-limit failure of a recertification through the SQL and VACUUM paths. DOWNGRADE_GATE_LIB is required: a build with -DCUVS_COVER_RECERT_TEST_GATE,
+# which lets the runner set the walk's RAM limit (CUVS_RECERT_GATE_RAM_LIMIT).
+test-cover-limits-pg:
+	@test -n "$(DOWNGRADE_OLD_LIB)" || { echo "set DOWNGRADE_OLD_LIB"; exit 2; }
+	@test -n "$(DOWNGRADE_GATE_LIB)" || { echo "set DOWNGRADE_GATE_LIB"; exit 2; }
+	python3 test/unit/test_cover_limits_pg.py --output $(DOWNGRADE_OUT)-limits --new-lib $(DOWNGRADE_GATE_LIB) --old-lib $(DOWNGRADE_OLD_LIB)
+
+# The recertification while the table is written and used (inserts in the middle of the walk, the cover lock of an insert, a waiting DDL, the memory limit
+# on the lists, reserved descriptor bytes). DOWNGRADE_GATE_LIB is required (gates "walk" and "insert").
+test-cover-walk-pg:
+	@test -n "$(DOWNGRADE_OLD_LIB)" || { echo "set DOWNGRADE_OLD_LIB"; exit 2; }
+	@test -n "$(DOWNGRADE_GATE_LIB)" || { echo "set DOWNGRADE_GATE_LIB"; exit 2; }
+	python3 test/unit/test_cover_walk_pg.py --output $(DOWNGRADE_OUT)-walk --new-lib $(DOWNGRADE_GATE_LIB) --old-lib $(DOWNGRADE_OLD_LIB)
+
+# The pages of a recertification that does not publish (abandoned, deferred, cancelled): taken back by the next one, the index does not grow, an insert does not take
+# the index off the guarantee for them. DOWNGRADE_GATE_LIB is required (gates "recert" and "insert", and the limit of the growth monitor).
+test-cover-orphan-pg:
+	@test -n "$(DOWNGRADE_OLD_LIB)" || { echo "set DOWNGRADE_OLD_LIB"; exit 2; }
+	@test -n "$(DOWNGRADE_GATE_LIB)" || { echo "set DOWNGRADE_GATE_LIB"; exit 2; }
+	python3 test/unit/test_cover_orphan_pg.py --output $(DOWNGRADE_OUT)-orphan --new-lib $(DOWNGRADE_GATE_LIB) --old-lib $(DOWNGRADE_OLD_LIB)
+
+# The structural reachability walk on real pgvector hnsw indexes against an independent oracle (needs pgvector, PostgreSQL
+# server headers and psql; starts its own cluster).
+.PHONY: test-cover-reach-pg
+test-cover-reach-pg:
+	python3 test/unit/test_cover_reach_pg.py --output $(or $(COVER_REACH_PG_OUT),/tmp/pgcuvs-cover-reach-pg-results)
+test-downgrade-pg:
+	@test -n "$(DOWNGRADE_OLD_LIB)" || { echo "set DOWNGRADE_OLD_LIB"; exit 2; }
+	python3 test/unit/test_downgrade_pg.py --output $(DOWNGRADE_OUT) --new-lib $(DOWNGRADE_NEW_LIB) --old-lib $(DOWNGRADE_OLD_LIB)
+test-downgrade-mutations:
+	@test -n "$(DOWNGRADE_OLD_LIB)" || { echo "set DOWNGRADE_OLD_LIB"; exit 2; }
+	python3 test/unit/test_downgrade_mutations.py --output $(DOWNGRADE_OUT)-mutations -- --new-lib $(DOWNGRADE_NEW_LIB) --old-lib $(DOWNGRADE_OLD_LIB)
 
 # Explicit exact scans of pg_cuvs_hnsw on a real PostgreSQL 16 backend (CPU only, no
 # daemon). The four scripts need a disposable cluster that preloads pg_cuvs, with the

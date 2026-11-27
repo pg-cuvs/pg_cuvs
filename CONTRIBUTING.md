@@ -110,7 +110,7 @@ Fewer versions, fewer ways to be wrong.
 
 **SQL scripts of a version are never edited in place.** `sql/pg_cuvs--X.Y.Z.sql` and
 `sql/pg_cuvs--<from>--X.Y.Z.sql` may change only while `X.Y.Z` is the version in
-development on `main`. The commit that moves `default_version` past `X.Y.Z` freezes
+development on `main`. A downgrade script `sql/pg_cuvs--X.Y.Z--<to>.sql` belongs to `X.Y.Z`, the version it leaves, and is frozen with it. The commit that moves `default_version` past `X.Y.Z` freezes
 them, because after that point databases installed from that version exist, and a
 catalog that a later edit would change can no longer be repaired by an upgrade.
 0.9.0 had no such point: seven commits changed its scripts after the commit that

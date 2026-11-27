@@ -91,6 +91,10 @@
 #include "cuvs_hnsw_build.h"
 #include "hnsw_export.h"
 #include "cuvs_hnsw_scan.h"
+#include "cuvs_cover_format.h"
+#include "cuvs_cover_ledger.h"
+#include "cuvs_cover_insert.h"
+#include "cuvs_cover_recert.h"
 #include "storage/buffile.h"
 #include "storage/fd.h"
 
@@ -216,14 +220,87 @@ hnsw_store_connectivity(Page page, const CuvsConnectivity *c)
     memcpy((char*)page+at,c,sizeof(*c));
     h->pd_upper=at;
 }
+
+/* An index whose access method routine came from the NEW handler symbol carries a
+ * cover descriptor above pd_upper; one from the old symbol is built exactly as before. The routine is the marker:
+ * only the new one installs cuvs_cover_buildempty. */
+static void cuvs_cover_buildempty(Relation indexRel);
+StaticAssertDecl(sizeof(CuvsConnectivity) == CUVS_COVER_CONN_SIZE, "connectivity record is 64 bytes");
+
+static bool
+hnsw_cover_enabled(Relation rel)
+{
+    return rel->rd_indam != NULL && rel->rd_indam->ambuildempty == cuvs_cover_buildempty;
+}
+
+bool
+cuvs_hnsw_index_is_cover(Relation rel)
+{
+    return hnsw_cover_enabled(rel);
+}
+
+/* The single place that finishes a metapage. `empty` is a build over zero rows: nothing can be
+ * unreachable, so it starts CERTIFIED with an empty ledger at block 2. Every other build starts LOST(uncertified)
+ * until a certification has run. For an old-symbol index this is hnsw_store_connectivity and nothing else. */
+static void
+hnsw_stage_metapage_tail(Relation rel, Page page, const CuvsConnectivity *c, bool empty)
+{
+    CuvsCoverDescriptor d;
+
+    if (!hnsw_cover_enabled(rel))
+    {
+        hnsw_store_connectivity(page, c);
+        return;
+    }
+    memset(&d, 0, sizeof(d));
+    d.magic = CUVS_COVER_D_MAGIC;
+    d.format_version = CUVS_COVER_FORMAT_VERSION;
+    d.min_reader_version = 1;
+    d.d_len = CUVS_COVER_D_SIZE;
+    d.free_head = CUVS_COVER_INVALID_BLOCK;
+    d.ledger_head = CUVS_COVER_INVALID_BLOCK;
+    d.ledger_tail = CUVS_COVER_INVALID_BLOCK;
+    if (empty)
+    {
+        d.state = CUVS_COVER_STATE_CERTIFIED;
+        d.generation = 1;
+        d.ledger_head = d.ledger_tail = 2;
+        d.graph_nblocks_at_cert = 3;
+    }
+    else
+    {
+        d.state = CUVS_COVER_STATE_LOST;
+        d.reason = CUVS_COVER_REASON_UNCERTIFIED;
+    }
+    cuvs_cover_descriptor_seal(&d);
+    if (cuvs_cover_stage_tail((uint8_t *) page, (const uint8_t *) c, &d) != 0)
+        ereport(ERROR, (errmsg("pg_cuvs: the metapage has no room for the cover descriptor")));
+}
+
+/* Fail closed: a pgvector metapage of a cover index is only written when it classifies as a descriptor state. */
+static void
+hnsw_cover_check_metapage(Relation rel, Page staged)
+{
+    CuvsCoverResult r;
+
+    if (!hnsw_cover_enabled(rel) || cuvs_cover_get32((const uint8_t *) staged, CUVS_COVER_OFF_PGV_MAGIC) != CUVS_COVER_PGV_MAGIC)
+        return;
+    cuvs_cover_classify((const uint8_t *) staged, NULL, &r);
+    if (!((r.cls == CUVS_COVER_CERTIFIED || r.cls == CUVS_COVER_LOST || r.cls == CUVS_COVER_OFF) && r.writable))
+        ereport(ERROR, (errcode(ERRCODE_INDEX_CORRUPTED),
+                        errmsg("pg_cuvs: refusing to publish a metapage without a cover descriptor")));
+}
 static CuvsConnectivity
 hnsw_read_connectivity(Page page)
 {
     CuvsConnectivity c={0};
     PageHeader h=(PageHeader)page;
+    /* The record sits right below the special area. An index with a cover descriptor has pd_upper further down
+     * (above the descriptor), so the position is special - 64, not pd_upper; a page whose pd_upper is the special
+     * offset has no record. */
     if(h->pd_special<=BLCKSZ && h->pd_special>=sizeof(c) &&
-       h->pd_upper==h->pd_special-sizeof(c) && h->pd_lower<=h->pd_upper)
-        memcpy(&c,(char*)page+h->pd_upper,sizeof(c));
+       h->pd_upper<=h->pd_special-sizeof(c) && h->pd_lower<=h->pd_upper)
+        memcpy(&c,(char*)page+h->pd_special-sizeof(c),sizeof(c));
     if(c.magic!=CUVS_CONNECTIVITY_MAGIC || c.version!=1 ||
        c.available>CUVS_CONNECTIVITY_DISABLED || c.spilled>1 ||
        c.unreachable>c.nodes || c.unreachable_l0>c.nodes ||
@@ -2856,7 +2933,7 @@ fill_hnsw_from_hnswlib_impl(Oid cagra_oid, Oid hnsw_oid, bool use_shm,
         /* Update pd_lower to reflect the metapage data (pgvector pattern). */
         ((PageHeader)page)->pd_lower =
             (uint16_t)(((char *)metap + sizeof(PgvHnswMeta)) - (char *)page);
-        hnsw_store_connectivity(page,&connectivity);
+        hnsw_stage_metapage_tail(hnsw_rel,page,&connectivity,false);
 
         hnsw_publish_staged_page(hnsw_rel, page, hnsw_unlogged);
         pfree(page);
@@ -3457,8 +3534,10 @@ hnsw_read_disk_row(int hnsw_fd, int tids_fd,
 static void
 hnsw_publish_staged_page(Relation rel, Page staged, bool skip_wal)
 {
-    Buffer buf = ReadBuffer(rel, P_NEW);
+    Buffer buf;
 
+    hnsw_cover_check_metapage(rel, staged);
+    buf = ReadBuffer(rel, P_NEW);
     LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
     START_CRIT_SECTION();
     memcpy(BufferGetPage(buf), staged, BLCKSZ);
@@ -3736,7 +3815,7 @@ hnsw_write_disk_metapage(Relation rel, const HnswlibHeader *header,
                nn, sizeof(*nn));
         ((PageHeader)staged)->pd_lower += sizeof(*nn);
     }
-    hnsw_store_connectivity(staged, connectivity);
+    hnsw_stage_metapage_tail(rel, staged, connectivity, false);
     hnsw_publish_staged_page(rel, staged, skip_wal);
     pfree(staged);
 }
@@ -3804,7 +3883,7 @@ hnsw_import_empty_build_result(Relation indexRel,
                 c.magic=CUVS_CONNECTIVITY_MAGIC;c.version=1;c.available=CUVS_CONNECTIVITY_MEASURED;
             } else
                 cuvs_connectivity_set_disabled(&c);
-            hnsw_store_connectivity(metapage,&c);
+            hnsw_stage_metapage_tail(indexRel,metapage,&c,true);
             hnsw_notice_connectivity(&c);
         }
         /* The caller holds the lock its command takes on the index being built: AccessExclusiveLock for CREATE INDEX
@@ -3834,6 +3913,16 @@ hnsw_import_empty_build_result(Relation indexRel,
         }
         hnsw_publish_staged_page(s->target, metapage, skip_wal);
         hnsw_publish_staged_page(s->target, first_data_page, skip_wal);
+        if (hnsw_cover_enabled(indexRel))
+        {
+            Page ledger_page = (Page)palloc(BLCKSZ);
+
+            cuvs_ledger_page_init((uint8_t *) ledger_page, CUVS_LEDGER_KIND_KEYS, 1, 0, CUVS_LEDGER_NO_BLOCK, 3);
+            hnsw_publish_staged_page(s->target, ledger_page, skip_wal);
+            pfree(ledger_page);
+            if (RelationGetNumberOfBlocks(s->target) != 3)
+                ereport(ERROR, (errmsg("pg_cuvs: the ledger page of an empty index must be block 2")));
+        }
         index_close(s->target, NoLock);
         s->target = NULL;
     }
@@ -4514,7 +4603,7 @@ fill_hnsw_from_cagra_ipc_impl(Oid cagra_oid, Oid hnsw_oid, const char *mode,
 
         ((PageHeader)page)->pd_lower =
             (uint16_t)(((char *)metap + sizeof(PgvHnswMeta)) - (char *)page);
-        hnsw_store_connectivity(page,&connectivity);
+        hnsw_stage_metapage_tail(hnsw_rel,page,&connectivity,false);
 
         hnsw_publish_staged_page(hnsw_rel, page, hnsw_unlogged);
         pfree(page);
@@ -4955,6 +5044,20 @@ pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
         index_close(target, AccessExclusiveLock);
     }
 
+    /* the same tail as a build by CREATE INDEX: certify the new index (it started LOST, uncertified) */
+    {
+        Relation hnsw_idx = index_open(hnsw_oid, ShareUpdateExclusiveLock);
+
+        if (hnsw_cover_enabled(hnsw_idx))
+        {
+            Relation hnsw_heap = table_open(IndexGetRelation(hnsw_oid, false), ShareUpdateExclusiveLock);
+
+            cuvs_cover_certify_after_build(hnsw_heap, hnsw_idx);
+            table_close(hnsw_heap, NoLock);
+        }
+        index_close(hnsw_idx, NoLock);
+    }
+
     index_close(cagra_rel, AccessShareLock);
     /* As in a regular CREATE INDEX, block table writes through commit of the
      * populated, ready index. The source probe and the import use one lock. */
@@ -5302,7 +5405,7 @@ cuvs_hnsw_ambuildempty(Relation index)
 }
 
 static IndexBuildResult *
-cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
+cuvs_hnsw_ambuild_impl(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
 {
     CuvsHnswOptions *opts = (CuvsHnswOptions *) indexRel->rd_options;
     const char *source_name = (opts != NULL && opts->source_offset != 0)
@@ -5688,9 +5791,90 @@ pg_cuvs_hnsw_layer_counts(PG_FUNCTION_ARGS)
     PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
 
-PG_FUNCTION_INFO_V1(pg_cuvs_hnsw_handler);
-Datum
-pg_cuvs_hnsw_handler(PG_FUNCTION_ARGS)
+/* ambuild: the build above, then (for an index of the new handler symbol) the certification every build of rows ends with.
+ * An empty table starts CERTIFIED already and the certification finds nothing to do. */
+static IndexBuildResult *
+cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
+{
+    IndexBuildResult *result = cuvs_hnsw_ambuild_impl(heapRel, indexRel, indexInfo);
+
+    if (hnsw_cover_enabled(indexRel))
+        cuvs_cover_certify_after_build(heapRel, indexRel);
+    return result;
+}
+
+/* ambuildempty of a cover index: let pgvector write the init fork, then give its metapage the descriptor (CERTIFIED,
+ * empty ledger) and append the ledger page as block 2. UNLOGGED indexes are copied from this fork by crash recovery,
+ * so a crash reset yields the same classification as a fresh empty build. */
+static void (*pgv_ambuildempty) (Relation) = NULL;
+
+static void
+cuvs_cover_buildempty(Relation indexRel)
+{
+    Buffer      buf;
+    Page        meta = (Page) palloc(BLCKSZ);
+    Page        ledger = (Page) palloc(BLCKSZ);
+    CuvsConnectivity c;
+
+    Assert(pgv_ambuildempty != NULL);
+    pgv_ambuildempty(indexRel);
+
+    memset(&c, 0, sizeof(c));
+    if (cuvs_hnsw_connectivity_check)
+    {
+        c.magic = CUVS_CONNECTIVITY_MAGIC;
+        c.version = 1;
+        c.available = CUVS_CONNECTIVITY_MEASURED;
+    }
+    else
+        cuvs_connectivity_set_disabled(&c);
+
+    buf = ReadBufferExtended(indexRel, INIT_FORKNUM, 0, RBM_NORMAL, NULL);
+    LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+    memcpy(meta, BufferGetPage(buf), BLCKSZ);
+    hnsw_stage_metapage_tail(indexRel, meta, &c, true);
+    hnsw_cover_check_metapage(indexRel, meta);
+    START_CRIT_SECTION();
+    memcpy(BufferGetPage(buf), meta, BLCKSZ);
+    MarkBufferDirty(buf);
+    log_newpage_buffer(buf, true);
+    END_CRIT_SECTION();
+    UnlockReleaseBuffer(buf);
+
+    cuvs_ledger_page_init((uint8_t *) ledger, CUVS_LEDGER_KIND_KEYS, 1, 0, CUVS_LEDGER_NO_BLOCK, 3);
+    buf = ReadBufferExtended(indexRel, INIT_FORKNUM, P_NEW, RBM_NORMAL, NULL);
+    LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+    if (BufferGetBlockNumber(buf) != 2)
+        ereport(ERROR, (errmsg("pg_cuvs: the ledger page of an empty index must be block 2, got %u", BufferGetBlockNumber(buf))));
+    START_CRIT_SECTION();
+    memcpy(BufferGetPage(buf), ledger, BLCKSZ);
+    MarkBufferDirty(buf);
+    log_newpage_buffer(buf, true);
+    END_CRIT_SECTION();
+    UnlockReleaseBuffer(buf);
+    pfree(meta);
+    pfree(ledger);
+}
+
+
+/*
+ * Two C symbols name the same access method handler on purpose.
+ *
+ *   pg_cuvs_hnsw_handler      the OLD symbol: SQL of 0.9.2 and earlier points here. It must
+ *                             keep returning the routine of an index without a cover
+ *                             descriptor (no cover wrappers), so a cluster that has not run
+ *                             ALTER EXTENSION UPDATE never gets a new-format index.
+ *   pg_cuvs_hnsw_handler_c1p  the NEW symbol: SQL of 0.9.3 points here. An older library does
+ *                             not export it, so an index of an updated database cannot be
+ *                             opened by it: the failure is loud (could not find function)
+ *                             instead of an old build writing into a new-format index.
+ *
+ * Both return the same routine today because no cover wrapper is wired into the product yet.
+ * When one is, only the NEW symbol may install it; test-cover-symbols checks that both
+ * symbols are exported and that the SQL points at the right one.
+ */
+static IndexAmRoutine *
+cuvs_hnsw_handler_routine(bool cover)
 {
     /* Borrow pgvector's build-independent operations and read capabilities.
      * The scan wrapper delegates by default and selects exact heap execution
@@ -5714,5 +5898,28 @@ pg_cuvs_hnsw_handler(PG_FUNCTION_ARGS)
      * its delegate path and connects the explicitly selected exact heap mode. */
     cuvs_hnsw_scan_wrap(amroutine);
 
-    PG_RETURN_POINTER(amroutine);
+    /* cover wrappers belong here and only when `cover`. ambuildempty is also the marker hnsw_cover_enabled() looks for. */
+    if (cover)
+    {
+        pgv_ambuildempty = amroutine->ambuildempty;
+        amroutine->ambuildempty = cuvs_cover_buildempty;
+        cuvs_cover_wrap_insert(amroutine);
+        cuvs_cover_wrap_vacuum(amroutine);
+    }
+
+    return amroutine;
+}
+
+PG_FUNCTION_INFO_V1(pg_cuvs_hnsw_handler);
+Datum
+pg_cuvs_hnsw_handler(PG_FUNCTION_ARGS)
+{
+    PG_RETURN_POINTER(cuvs_hnsw_handler_routine(false));
+}
+
+PG_FUNCTION_INFO_V1(pg_cuvs_hnsw_handler_c1p);
+Datum
+pg_cuvs_hnsw_handler_c1p(PG_FUNCTION_ARGS)
+{
+    PG_RETURN_POINTER(cuvs_hnsw_handler_routine(true));
 }

@@ -5,8 +5,11 @@
 #   scripts/check-sql-frozen.sh <base-commit> [<head-commit>] [--release-branch X.Y.Z]
 #
 # The version in development is default_version of pg_cuvs.control at <head-commit>
-# (default HEAD). sql/pg_cuvs--A.sql and sql/pg_cuvs--A--B.sql belong to the
-# version A, respectively B. Between <base-commit> and <head-commit>:
+# (default HEAD). sql/pg_cuvs--A.sql belongs to the version A and sql/pg_cuvs--A--B.sql
+# to the larger of A and B: an upgrade is part of the version it lands on, a downgrade
+# (A > B) is made and checked together with the version it leaves, so it can still be
+# fixed while A is in development and is frozen with A. Between <base-commit> and
+# <head-commit>:
 #
 #   * a script of a version below the development version must not be modified,
 #     deleted or renamed; a new script of any version may be added;
@@ -65,6 +68,9 @@ while IFS=$'\t' read -r status path; do
         continue
     fi
     target="${BASH_REMATCH[3]:-${BASH_REMATCH[1]}}"
+    if [[ -n "${BASH_REMATCH[3]}" ]] && older_than "$target" "${BASH_REMATCH[1]}"; then
+        target="${BASH_REMATCH[1]}"	# a downgrade belongs to the version it leaves
+    fi
     if [[ -n "$release_version" ]]; then
         if [[ "$status" == "A" && "$target" == "$release_version" ]]; then
             continue

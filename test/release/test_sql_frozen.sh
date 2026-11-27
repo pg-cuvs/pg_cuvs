@@ -131,6 +131,22 @@ d="$(fixture release-none)"
 echo "fix" > "$d/fix.c"; git -C "$d" add -A && git -C "$d" commit -q -m "C fix on a release branch"
 verdict "on a release branch a change without SQL passes" "$d" 0 "[OK]" HEAD~1 HEAD --release-branch 0.9.1
 
+# a downgrade script pg_cuvs--A--B.sql with A > B is made and verified with the development of A: it belongs to the
+# larger version, so it can still be fixed while A is in development and is frozen with A
+d="$(fixture downgrade-dev)"
+printf -- '-- 0.9.1 to 0.9.0\n' > "$d/sql/pg_cuvs--0.9.1--0.9.0.sql"
+git -C "$d" add -A && git -C "$d" commit -q -m "add the downgrade of the development version"
+echo "-- fixed" >> "$d/sql/pg_cuvs--0.9.1--0.9.0.sql"
+git -C "$d" commit -q -am "fix the downgrade of the development version"
+verdict "editing the downgrade script of the development version passes" "$d" 0 "[OK]" HEAD~1 HEAD
+
+d="$(fixture downgrade-frozen)"
+printf -- '-- 0.9.0 to 0.8.2\n' > "$d/sql/pg_cuvs--0.9.0--0.8.2.sql"
+git -C "$d" add -A && git -C "$d" commit -q -m "add a downgrade of a frozen version"
+echo "-- fixed" >> "$d/sql/pg_cuvs--0.9.0--0.8.2.sql"
+git -C "$d" commit -q -am "edit it"
+verdict "editing the downgrade script of a frozen version fails" "$d" 1 "M sql/pg_cuvs--0.9.0--0.8.2.sql" HEAD~1 HEAD
+
 d="$(fixture bad-ref)"
 verdict "an unknown base is an error" "$d" 1 "cannot resolve base" no-such-ref HEAD
 verdict "missing arguments are bad usage" "$d" 2 "usage"
