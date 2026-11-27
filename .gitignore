@@ -69,3 +69,10 @@ cache/
 
 # gpu-guard bypass / local hook state (see .claude/hooks/gpu-guard.sh)
 .claude/state/
+
+# Unit-test executables built by `make test-unit` and core files they may leave
+/test-*
+!/test-*.*
+/test-*.o
+/core
+core.*
