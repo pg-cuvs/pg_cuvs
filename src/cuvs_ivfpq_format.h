@@ -151,7 +151,7 @@ cuvs_npy_skip_payload(int fd, uint64_t *off, uint64_t *count, unsigned *width)
 {
     char descr[16];
     if (cuvs_npy_open(fd, off, count, width, descr, sizeof(descr)) != 0 ||
-        *count && *width > UINT64_MAX / *count)
+        (*count != 0 && *width > UINT64_MAX / *count))
         return -1;
     *off += *count * *width;
     return 0;
@@ -188,7 +188,8 @@ cuvs_ivfpq_estimate_resident_fd(int fd, uint64_t file_bytes,
                                 CuvsIvfPqResidentEstimate *out)
 {
     uint64_t off = 0, version, rows, dim, bits, pqdim, cma, metric, book, layout, nlists;
-    uint64_t count, width, delta = 0;
+    uint64_t count, delta = 0;
+    unsigned width;
     uint32_t *sizes;
     if (cuvs_npy_scalar_u64(fd, &off, &version) != 0 || version != 4 ||
         cuvs_npy_scalar_u64(fd, &off, &rows) != 0 ||

@@ -40,7 +40,7 @@ write_npy_header(int fd, const char *descr, const char *shape)
     size_t preamble = 10 + (size_t)dlen + 1;
     size_t padding = 64 - preamble % 64;
     uint16_t hlen = (uint16_t)(dlen + padding + 1);
-    if (dlen < 0 || padding > sizeof(pad) || (size_t)dlen + padding + 2 > sizeof(header))
+    if (dlen < 0 || padding > sizeof(pad))
         return -1;
     pre[8] = (unsigned char)hlen;
     pre[9] = (unsigned char)(hlen >> 8);
